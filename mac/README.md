@@ -28,7 +28,7 @@ SDPA at batch 8: 97 ms in 2.10, 6 ms in 2.14).
 # the paper's code, on MPS (bf16 autocast like the paper's CUDA runs), compiled
 python dust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/ref
 
-# backprop baselines: SGD (default), --optimizer adam|adamw
+# backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
 ```
 

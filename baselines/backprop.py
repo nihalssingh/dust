@@ -8,10 +8,12 @@ import sys
 import time
 
 import torch
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dust import GPTConfig, compile_model, evaluate, file_hash, load_sequences, make_model
-from model import BF16_DEVICES
+from model import BF16_DEVICES, norm
 
 
 DEFAULT_CONFIGS = {
@@ -52,10 +54,26 @@ def make_optimizer(model, lr, momentum):
     return torch.optim.SGD(groups, lr=lr, momentum=momentum)
 
 
-def train_step(model, optimizer, x, y):
+def checkpointed_forward(model, idx, targets):
+    """GPT.forward with each block recomputed during backward (activation checkpointing)."""
+    B, T = idx.size()
+    cos_sin = (model.cos[:, :T], model.sin[:, :T])
+    x = norm(model.transformer.wte(idx))
+    x0 = x
+    for i, block in enumerate(model.transformer.h):
+        x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
+        ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
+        x = checkpoint(block, x, ve, cos_sin, model.window_sizes[i], use_reentrant=False)
+    x = norm(x)
+    logits = model.lm_head(x)[..., :model.config.vocab_size].float()
+    logits = 15 * torch.tanh(logits / 15)
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+
+def train_step(model, optimizer, x, y, checkpointing=False):
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.device.type in BF16_DEVICES):
-        loss = model(x, y)
+        loss = checkpointed_forward(model, x, y) if checkpointing else model(x, y)
     if not torch.isfinite(loss):
         raise FloatingPointError('Non-finite backpropagation loss')
     loss.backward()
@@ -81,6 +99,7 @@ def main():
              'scales the embedding and scalar rates with it, --momentum sets beta1.',
     )
     parser.add_argument('--weight-decay', type=float, default=0.0, help='Matrix weight decay (adam/adamw only).')
+    parser.add_argument('--checkpointing', action='store_true', help='Recompute each block during backward.')
     parser.add_argument('--compile', action='store_true', help='torch.compile the model.')
     parser.add_argument(
         '--device', choices=['cuda', 'mps'],
@@ -95,6 +114,8 @@ def main():
         args.lr = ADAM_DEFAULTS['lr'] if args.lr is None else args.lr
         args.momentum = ADAM_DEFAULTS['beta1'] if args.momentum is None else args.momentum
 
+    if args.compile and args.checkpointing:
+        parser.error('--compile does not cover the checkpointed forward; use one or the other')
     if int(os.environ.get('WORLD_SIZE', 1)) != 1:
         parser.error('This baseline uses one GPU; launch it with python, not torchrun.')
     if args.lr <= 0 or not 0 <= args.momentum < 1:
@@ -147,7 +168,7 @@ def main():
         method='backprop', tokens=args.tokens, seed=args.seed, steps=steps,
         optimizer=args.optimizer, lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay if args.optimizer != 'sgd' else 0.0,
-        device=device.type, compiled=args.compile,
+        checkpointing=args.checkpointing, device=device.type, compiled=args.compile,
         training_tokens=steps * 8 * config.sequence_len,
         validation_sequences=544, test_sequences=544, model=asdict(config),
         parameter_groups=[dict(lr=g['lr'], momentum=g.get('momentum'), betas=g.get('betas'),
@@ -177,7 +198,9 @@ def main():
 
     for step in range(1, steps + 1):
         batch = training[(step - 1) * 8:step * 8].to(device)
-        loss = train_step(model, optimizer, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
+        loss = train_step(
+            model, optimizer, batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), args.checkpointing,
+        )
         record = dict(step=step, train_loss=loss, elapsed_seconds=time.monotonic() - start)
         if step == 1 or step % interval == 0 or step == steps:
             value = evaluate(model, validation, device)
