@@ -25,8 +25,8 @@ SDPA at batch 8: 97 ms in 2.10, 6 ms in 2.14).
 ## Running
 
 ```bash
-# the paper's code, on MPS (bf16 autocast like the paper's CUDA runs)
-python dust.py --tokens 1M --population 256 --data-dir ../data --output ../runs/ref
+# the paper's code, on MPS (bf16 autocast like the paper's CUDA runs), compiled
+python dust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/ref
 ```
 
 ## The changes
@@ -38,3 +38,4 @@ python dust.py --tokens 1M --population 256 --data-dir ../data --output ../runs/
 | CUDA-or-MPS device selection, bf16 autocast and bf16 embedding storage on MPS | N | mirrors the paper's CUDA setup |
 | full-window attention via `is_causal` | E | the window covers the sequence, so the mask is exactly causal |
 | sliding-window attention in query chunks of 256, each against only its in-window keys | E | bitwise identical on MPS; 1.8x faster for the six windowed blocks |
+| `torch.compile` (`--compile`) | N | 2x; cosines with the true gradient unchanged |

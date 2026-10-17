@@ -450,6 +450,15 @@ def make_model(config, device, seed):
     return model.requires_grad_(False)
 
 
+def compile_model(model):
+    """torch.compile the forward. Each set of jittered sites traces its own graph, about 30 in all."""
+    import torch._dynamo
+    torch._dynamo.config.recompile_limit = 64
+    torch._dynamo.config.accumulated_recompile_limit = 512
+    model.compile()
+    return model
+
+
 def make_optimizer(model, settings):
     groups = {}
     for name, parameter in model.named_parameters():
@@ -493,6 +502,7 @@ def main():
         '--device', choices=['cuda', 'mps'],
         help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
     )
+    parser.add_argument('--compile', action='store_true', help='torch.compile the model (hooks included).')
     args = parser.parse_args()
 
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
@@ -538,6 +548,8 @@ def main():
 
     # Every rank sees the same batch; only the perturbation population is divided across ranks.
     model = make_model(config, device, args.seed)
+    if args.compile:
+        compile_model(model)
     optimizer = make_optimizer(model, settings)
     estimator = DUST(model, settings, args.seed, rank, world)
     if args.output.exists() and any(args.output.iterdir()):
@@ -566,6 +578,7 @@ def main():
         model_sha256=file_hash(Path(__file__).parent / 'model.py'),
         torch_version=torch.__version__,
         device=device.type,
+        compiled=args.compile,
     )
     if rank == 0:
         metadata['data_sha256'] = {k: file_hash(v) for k, v in paths.items()}

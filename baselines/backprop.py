@@ -10,7 +10,7 @@ import time
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dust import GPTConfig, evaluate, file_hash, load_sequences, make_model
+from dust import GPTConfig, compile_model, evaluate, file_hash, load_sequences, make_model
 from model import BF16_DEVICES
 
 
@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--lr', type=float, help='Override the base learning rate for the selected token budget.')
     parser.add_argument('--momentum', type=float, help='Override SGD momentum for the selected token budget.')
     parser.add_argument('--steps', type=int, help='Stop early; keep the full selected training subset.')
+    parser.add_argument('--compile', action='store_true', help='torch.compile the model.')
     parser.add_argument(
         '--device', choices=['cuda', 'mps'],
         help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
@@ -100,6 +101,8 @@ def main():
     steps = args.steps or steps
 
     model = make_model(config, device, args.seed).requires_grad_(True)
+    if args.compile:
+        compile_model(model)
     optimizer = make_optimizer(model, args.lr, args.momentum)
     if args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f'Choose an empty output directory: {args.output}')
@@ -107,7 +110,7 @@ def main():
     metadata = dict(
         method='backprop', tokens=args.tokens, seed=args.seed, steps=steps,
         lr=args.lr, momentum=args.momentum, weight_decay=0.0,
-        device=device.type,
+        device=device.type, compiled=args.compile,
         training_tokens=steps * 8 * config.sequence_len,
         validation_sequences=544, test_sequences=544, model=asdict(config),
         parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],
