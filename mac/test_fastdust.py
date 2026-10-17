@@ -4,6 +4,7 @@ E options must reproduce dust.DUST draw for draw (same seed, same noise). A1 opt
 running and, where the answer is known exactly (the exact head), against backprop.
     python mac/test_fastdust.py
 """
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -74,6 +75,8 @@ def main():
         ('A1 exact_head', fastdust.Options(exact_head=True)),
         ('A1 derive_hidden', fastdust.Options(derive_hidden=True)),
         ('A1 derive_attn_out', fastdust.Options(derive_attn_out=True)),
+        ('A1 antithetic', fastdust.Options(antithetic=True)),
+        ('A1 rademacher', fastdust.Options(rademacher=True)),
     ]
     for label, options in checks:
         grads, _ = estimates(lambda m: fastdust.FastDUST(m, settings, options, seed=42), config, x, y)
@@ -108,6 +111,23 @@ def main():
         worst = max(worst, (model_lib.attention(q, k, v, window) - ref_out).abs().max().item())
     print(f"{'PASS' if worst < 1e-5 else 'FAIL'} E chunked window attention vs single mask: max |diff| {worst:.1e}")
     ok &= worst < 1e-5
+
+    # nrep = 1 has no centering, so its scale is 1 (not (n - 1) / n = 0); antithetic + LOO is rejected.
+    one = replace(settings, writers=[2] * 8, hidden=[2] * 8, hubs=[2] * 8, embedding=2, head=16 * 1, nrep=1,
+                  local=dict(q=1, v=1, gate=1, k=1, ve=1))
+    grads, _ = estimates(lambda m: fastdust.FastDUST(m, one, fastdust.Options(
+        loo_baseline=True, block_output_draws=True, exact_head=True, exact_last_block=True), seed=42), config, x, y)
+    nonzero = all(grads[f'transformer.h.{i}.mlp.c_proj.weight'].abs().sum() > 0 for i in range(8))
+    print(f"{'PASS' if nonzero else 'FAIL'} nrep=1 estimates are not zeroed by the (n - 1) / n scale")
+    ok &= nonzero
+    try:
+        fastdust.FastDUST(dust.make_model(config, torch.device('cpu'), seed=42), settings,
+                          fastdust.Options(antithetic=True, loo_baseline=True))
+        rejected = False
+    except ValueError:
+        rejected = True
+    print(f"{'PASS' if rejected else 'FAIL'} antithetic + loo_baseline is rejected")
+    ok &= rejected
     print('ALL PASSED' if ok else 'SOME FAILED')
     sys.exit(0 if ok else 1)
 

@@ -33,6 +33,11 @@ python dust.py --tokens 1M --population 256 --compile --data-dir ../data --outpu
 # the same estimator, faster (tiers E + N)
 python fastdust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/exact
 
+# "A1 best": same expected update as the paper, much lower variance, about 3x cheaper per update
+python fastdust.py --tokens 1M --population 256 --compile --exact-head --derive-hidden --derive-attn-out \
+  --block-output-draws --derive-embedding --closed-form-local --loo-baseline --exact-last-block \
+  --data-dir ../data --output ../runs/a1
+
 # backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing, --target same-token (analysis)
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
 ```
@@ -60,7 +65,11 @@ python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output .
 | `derive_attn_out` | A1 | attention-output error = W_o^T e: no attention-output draws |
 | `derive_embedding` | A1 | token-embedding error from the block errors through the residual mix (and block 0's same-token attention map): no embedding draws |
 | `closed_form_local` | A1 | the attention internals' estimates replaced by the closed-form expectation of the paper's own local estimator (credit decay 0.98, own-token queries): no local draws, no local sampling noise |
+| `loo_baseline` | A1 | each token's reward baseline is the mean over all of a site's draws (leave-one-out) instead of the mean of its 2-draw chunk: K - 1 effective draws instead of K / 2. The paper's (n - 1) / n step scale is kept so its tuned learning rates still apply |
 | `exact_last_block` | A1 | the last block's output error exactly, from the exact head error through the final norm |
+| `skip_control_variate` | A1 | each block-output draw's skip-path part, (product of later residual scalars) x the exact last-block error, is subtracted from every token's loss change and added back afterwards: unbiased, and worth more than doubling the draws |
+| `orthogonal_scalar_es` | A1 | the residual-scalar ES directions are rows of a random rotation (same norm), so they do not overlap |
+| `antithetic`, `rademacher` | A1 | no measurable benefit here (the noise is first-order interference, which they do not cancel); `antithetic` cannot be combined with `loo_baseline` |
 
 Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
 exactly with an attention whose backward cuts cross-token paths, verified against brute force;

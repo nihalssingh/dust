@@ -11,7 +11,7 @@ block l starts at the jittered module from cached clean activations instead of r
 
 Scale: DUST's estimates carry fixed shrink factors that its tuned learning rates absorb. Direct-loss draws
 centered over a chunk of n draws estimate (n - 1) / n of the error; the head's batch centering gives
-(b - 1) / b. A1 options that remove a shrink (the exact head) multiply by the same factor,
+(b - 1) / b. A1 options that remove a shrink (antithetic pairs, the exact head) multiply by the same factor,
 so a training run keeps the reference's effective learning rates.
 """
 import argparse
@@ -50,15 +50,29 @@ class Options:
     # A1: token-embedding error from the block errors through the exact per-token maps of the residual mix
     #     (and block 0's same-token attention map): no embedding draws
     derive_embedding: bool = False
+    # A1: leave-one-out reward baseline over all draws of a site group instead of centering within each chunk
+    #     of nrep draws: K - 1 effective draws instead of K (n - 1) / n (2x at nrep = 2), same expected update
+    loo_baseline: bool = False
     # A1: the last block's output error exactly, from the exact head error through the final norm (no draws)
     exact_last_block: bool = False
+    # A1: control variate for each block-output draw: its skip-path part, (prod of later resid lambdas) x the
+    #     exact last-block error, is subtracted from each token's loss change and added back (unbiased)
+    skip_control_variate: bool = False
+    # A1: the residual-scalar ES draws use orthogonal directions (rows of a random rotation, same norm)
+    orthogonal_scalar_es: bool = False
+    # A1: draws come in +/- pairs inside each chunk (even-order terms of the loss change cancel)
+    antithetic: bool = False
+    # A1: +/-1 noise instead of Gaussian
+    rademacher: bool = False
     # A1: attention internals from the closed-form expectation of DUST's local estimator (credit decay gamma,
     #     own-token queries) given the attention-output error: no local draws, no local sampling noise
     closed_form_local: bool = False
 
     def tiers(self):
         tier = {'truncate': 'E', 'compile': 'N', 'exact_head': 'A1', 'derive_hidden': 'A1',
-                'derive_attn_out': 'A1', 'block_output_draws': 'A1', 'derive_embedding': 'A1', 'closed_form_local': 'A1', 'exact_last_block': 'A1'}
+                'derive_attn_out': 'A1', 'block_output_draws': 'A1', 'derive_embedding': 'A1', 'closed_form_local': 'A1', 'loo_baseline': 'A1', 'exact_last_block': 'A1',
+                'skip_control_variate': 'A1', 'orthogonal_scalar_es': 'A1',
+                'antithetic': 'A1', 'rademacher': 'A1'}
         return {f.name: tier[f.name] for f in fields(self) if getattr(self, f.name)}
 
 
@@ -217,6 +231,13 @@ class FastDUST(DUST):
         super().__init__(model, settings, seed, rank, world)
         self.close()  # the functional forward replaces the hooks
         self.options = options or Options()
+        if self.options.antithetic and settings.nrep % 2:
+            raise ValueError('Antithetic draws need an even number of draws per chunk (nrep).')
+        if self.options.antithetic and self.options.loo_baseline:
+            raise ValueError('antithetic and loo_baseline are alternative baselines; use one.')
+        o = self.options
+        if o.skip_control_variate and not (o.loo_baseline and o.block_output_draws and o.exact_head):
+            raise ValueError('skip_control_variate needs loo_baseline, block_output_draws and exact_head')
         cfg = model.config
         self.n_head = cfg.n_head
         self.blocks = []
@@ -241,8 +262,13 @@ class FastDUST(DUST):
     # ---- noise -------------------------------------------------------------------------------------------
     def chunk_noise(self, n, *shape):
         """Noise for one chunk of n draws, shape [n * shape[0], ...]."""
+        if self.options.antithetic:
+            half = self.noise(n // 2 * shape[0], *shape[1:])
+            if self.options.rademacher:
+                half = half.sign()
+            return torch.cat([half, -half])
         a = self.noise(n * shape[0], *shape[1:])
-        return a
+        return a.sign() if self.options.rademacher else a
 
     # ---- clean pass ----------------------------------------------------------------------------------------
     def capture(self, x, y):
@@ -398,18 +424,33 @@ class FastDUST(DUST):
             reps['hidden'] = self._rep(self.outputs[f'transformer.h.{layer}.mlp.c_fc'], n)
         return reps
 
-    def direct_errors(self, sites, draws, sigma):
+    def direct_errors(self, sites, draws, sigma, control=None):
         """As DUST.direct_errors (one-sided loss drops centered over each chunk), via the functional forward."""
         n = self.settings.nrep
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
         kind, layer = self._start(sites)
         reps = self._reps(kind, layer, n)
+        loo = self.options.loo_baseline and draws >= 2  # one draw has no leave-one-out baseline
+        if loo:  # sums for sum_i (l_i - mean_l) a_i, with l_i relative to the clean loss for precision
+            noise_sum = {s: torch.zeros_like(e) for s, e in errors.items()}
+            change_sum = torch.zeros(self.batch, self.length, device=self.device)
         for _ in range(draws // n):
             noise = {s: self.chunk_noise(n, self.batch, self.length, width(s)) for s in sites}
             jitter = {s: sigma * a for s, a in noise.items()}
             with self.autocast():
                 perturbed_loss = self._forward_from(kind, layer, jitter, n, reps).view(n, self.batch, self.length)
+            if loo:
+                change = perturbed_loss.float() - self.clean_loss.unsqueeze(0)
+                for site, known in (control or {}).items():  # remove the known part sigma <g~, a> per token
+                    a4 = noise[site].view(n, self.batch, self.length, -1).float()
+                    change = change - sigma * torch.einsum('btd,nbtd->nbt', known, a4)
+                change_sum += change.sum(0)
+                for site, a in noise.items():
+                    a4 = a.view(n, self.batch, self.length, -1).float()
+                    errors[site] += torch.einsum('nbt,nbtd->btd', change, a4)
+                    noise_sum[site] += a4.sum(0)
+                continue
             reward = self.clean_loss.unsqueeze(0) - perturbed_loss.float()
             if n > 1:
                 reward = reward - reward.mean(0, keepdim=True)
@@ -417,7 +458,15 @@ class FastDUST(DUST):
                 errors[site] -= torch.einsum(
                     'nbt,nbtd->btd', reward.to(self.dtype), a.view(n, self.batch, self.length, -1),
                 ).float() / sigma
-        return {s: error / draws for s, error in errors.items()}  # the same rounding as DUST.direct_errors
+        shrink = (n - 1) / n if n > 1 else 1.0  # the reference's expected scale (no centering at n = 1)
+        if loo:
+            mean_change = (change_sum / draws).unsqueeze(-1)
+            known = control or {}
+            return {s: ((e - mean_change * noise_sum[s]) / ((draws - 1) * sigma) + known.get(s, 0)) * shrink
+                    for s, e in errors.items()}
+        if not self.options.antithetic:
+            return {s: error / draws for s, error in errors.items()}  # the same rounding as DUST.direct_errors
+        return {s: error * (shrink / draws) for s, error in errors.items()}  # antithetic pairs: no centering shrink
 
     # ---- head ---------------------------------------------------------------------------------------------------
     def head_error(self, draws, sigma=0.05):
@@ -493,6 +542,35 @@ class FastDUST(DUST):
         if isinstance(module, nn.Embedding):
             return super().reassemble(site, error)
         return torch.einsum('btd,bti->di', error, x.float())
+
+    def scalar_gradients(self, draws, sigma=0.03):
+        """DUST.scalar_gradients; with orthogonal_scalar_es the directions are rows of a random rotation scaled
+        to norm sqrt(d), so E[a a^T] = I as before but the directions do not overlap."""
+        if not self.options.orthogonal_scalar_es:
+            return super().scalar_gradients(draws, sigma)
+        parameters = [self.model.resid_lambdas, self.model.x0_lambdas]
+        original = [p.clone() for p in parameters]
+        L = self.model.config.n_layer
+        d = 2 * L
+        gauss = self.noise(d, d, dtype=torch.float32)
+        q, r = torch.linalg.qr(gauss.cpu())
+        rotation = (q * torch.sign(torch.diagonal(r))).to(self.device)  # Haar-distributed
+        directions = rotation[:draws] * d ** 0.5
+        estimate = torch.zeros(2, L, device=self.device)
+        try:
+            for a in directions:
+                a = a.view(2, L)
+                losses = []
+                for sign in (1, -1):
+                    for p, clean, direction in zip(parameters, original, a):
+                        p.copy_(clean + sign * sigma * direction)
+                    losses.append(self.losses(self.x, self.y))
+                difference = (losses[0] - losses[1])[self.y != -1].sum() / (2 * sigma)
+                estimate += difference * a / draws
+        finally:
+            for p, clean in zip(parameters, original):
+                p.copy_(clean)
+        return dict(zip(('resid_lambdas', 'x0_lambdas'), estimate))
 
     def mix_errors(self, writer_errors):
         """Errors at each block's mixed input x_mix_i = lam_i x_(i-1) + lam0_i x0 from the block errors:
@@ -609,6 +687,11 @@ class FastDUST(DUST):
         r, world = self.settings, self.world
         cfg = self.model.config
         gradients, writer_errors = {}, {}
+        skip = None
+        if o.skip_control_variate:  # per-token skip-path errors (prod of later resid lambdas) x exact g_last
+            g_last = self.last_block_error() / ((r.nrep - 1) / r.nrep if r.nrep > 1 else 1.0)
+            lam = self.model.resid_lambdas.float()
+            skip = {l: g_last * torch.prod(lam[l + 1:]) for l in range(cfg.n_layer)}
         for layer in range(cfg.n_layer):
             prefix = f'transformer.h.{layer}.'
             writer_sites = [prefix + 'mlp.c_proj'] if o.block_output_draws else [prefix + 'attn.c_proj', prefix + 'mlp.c_proj']
@@ -623,7 +706,8 @@ class FastDUST(DUST):
             if not o.derive_hidden:
                 groups.append(([prefix + 'mlp.c_fc'], r.hidden[layer]))
             for sites, count in groups:
-                for site, error in self.direct_errors(sites, count // world, 0.2).items():
+                control = {prefix + 'mlp.c_proj': skip[layer]} if skip is not None and sites == writer_sites else None
+                for site, error in self.direct_errors(sites, count // world, 0.2, control).items():
                     gradients[site + '.weight'] = self.reassemble(site, error)
                     writer_errors[site] = error
             if o.derive_hidden or o.block_output_draws:  # relu(h)^2 has derivative 2 relu(h)
@@ -720,6 +804,9 @@ def main():
             setattr(settings, stream, int(value * factor))
     if args.writers is not None:
         settings.writers = list(args.writers)
+    drawn = settings.writers[:-1] if options.exact_last_block else settings.writers
+    if options.loo_baseline and min(drawn) < 2:
+        parser.error('the leave-one-out baseline needs at least 2 draws per drawn block')
     defaults = dust.DEFAULT_CONFIGS[args.tokens]
     config = GPTConfig()
     steps = defaults['steps']
