@@ -1,6 +1,6 @@
 """Exactness tests for fastdust.py on CPU in float32 with a small config.
 
-E options must reproduce dust.DUST draw for draw (same seed, same noise). A1 options are only checked for
+E options must reproduce dust.DUST draw for draw (same seed, same noise). A1/A2 options are only checked for
 running and, where the answer is known exactly (the exact head), against backprop.
     python mac/test_fastdust.py
 """
@@ -77,6 +77,7 @@ def main():
         ('A1 derive_attn_out', fastdust.Options(derive_attn_out=True)),
         ('A1 antithetic', fastdust.Options(antithetic=True)),
         ('A1 rademacher', fastdust.Options(rademacher=True)),
+        ('A2 freeze_attention+scalars', fastdust.Options(freeze_attention=True, freeze_scalars=True)),
     ]
     for label, options in checks:
         grads, _ = estimates(lambda m: fastdust.FastDUST(m, settings, options, seed=42), config, x, y)

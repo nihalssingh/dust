@@ -9,6 +9,7 @@ Every change is labeled with what it does to the algorithm:
 | **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | bit-for-bit against `dust.py` on CPU in float32 with the same noise (`mac/test_fastdust.py`), and the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
 | **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged |
 | **A1**, algorithmic, same target | a different estimator of the same expected update (the paper's same-token target), with less variance or cost | expectation checks against exact targets, then cosine and training loss |
+| **A2**, approximation | changes what is estimated (biased, reduced or hybrid) | cosine and training loss; the bias is stated |
 
 Tested on a MacBook Pro (M5, 10-core, 24 GB unified memory), macOS 26, PyTorch 2.14.1.
 
@@ -70,6 +71,9 @@ python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output .
 | `skip_control_variate` | A1 | each block-output draw's skip-path part, (product of later residual scalars) x the exact last-block error, is subtracted from every token's loss change and added back afterwards: unbiased, and worth more than doubling the draws |
 | `orthogonal_scalar_es` | A1 | the residual-scalar ES directions are rows of a random rotation (same norm), so they do not overlap |
 | `antithetic`, `rademacher` | A1 | no measurable benefit here (the noise is first-order interference, which they do not cancel); `antithetic` cannot be combined with `loo_baseline` |
+| `local_attention_backward` | A2 | attention internals from one attention layer's exact local backward (credit decay 1 instead of 0.98: a different target) |
+| `scalars_from_errors` | A2 | residual scalars from the block errors (same-token target) instead of weight-space ES (full target); measured worse, not recommended |
+| `freeze_attention`, `freeze_scalars` | A2 | no updates for those parameters |
 
 Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
 exactly with an attention whose backward cuts cross-token paths, verified against brute force;

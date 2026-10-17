@@ -4,6 +4,7 @@ Each option has a tier:
   E   exact: the same estimator; with the same noise, the same numbers up to float rounding
   N   numerical: the same algorithm with different arithmetic (e.g. torch.compile fusion)
   A1  algorithmic, same target: another estimator of the same expected update, with lower variance or cost
+  A2  approximation: biased, reduced or hybrid
 
 With the default Options (E only), FastDUST draws the same noise in the same order as DUST and gives the same
 estimates. Draws run through an explicit functional forward instead of module hooks, so a draw that jitters
@@ -64,15 +65,25 @@ class Options:
     antithetic: bool = False
     # A1: +/-1 noise instead of Gaussian
     rademacher: bool = False
+    # A2: no estimates for the attention internals (q, k, v, gate, value embeddings); they stay at init
+    freeze_attention: bool = False
+    # A2: no ES draws for the 2L residual mixing scalars; they stay at init
+    freeze_scalars: bool = False
     # A1: attention internals from the closed-form expectation of DUST's local estimator (credit decay gamma,
     #     own-token queries) given the attention-output error: no local draws, no local sampling noise
     closed_form_local: bool = False
+    # A2: residual scalars from the block errors (same-token target) instead of weight-space ES (full target)
+    scalars_from_errors: bool = False
+    # A2 (hybrid): attention internals from one attention layer's exact local backward, driven by the
+    #     estimated attention-output error, instead of local draws (chain rule across tokens, inside one layer)
+    local_attention_backward: bool = False
 
     def tiers(self):
         tier = {'truncate': 'E', 'compile': 'N', 'exact_head': 'A1', 'derive_hidden': 'A1',
                 'derive_attn_out': 'A1', 'block_output_draws': 'A1', 'derive_embedding': 'A1', 'closed_form_local': 'A1', 'loo_baseline': 'A1', 'exact_last_block': 'A1',
                 'skip_control_variate': 'A1', 'orthogonal_scalar_es': 'A1',
-                'antithetic': 'A1', 'rademacher': 'A1'}
+                'antithetic': 'A1', 'rademacher': 'A1',
+                'freeze_attention': 'A2', 'freeze_scalars': 'A2', 'scalars_from_errors': 'A2', 'local_attention_backward': 'A2'}
         return {f.name: tier[f.name] for f in fields(self) if getattr(self, f.name)}
 
 
@@ -222,6 +233,16 @@ def _same_token_attention(q, k, v, window):
     o, v_dead = out.detach().to(dt), v.detach().to(dt)
     live = (o - p_dead * v_dead + p_live * v.to(dt)) / (1 - p_dead + p_live)
     return out + (live - live.detach()).to(out.dtype)
+
+
+def _attention_from_outputs(q_raw, k_raw, v_raw, z, ve, cos, sin, window: int, n_head: int):
+    """A block's attention output o from its projection outputs (same ops as the model), for local backward."""
+    B, T, _ = q_raw.shape
+    q, k, v = (t.view(B, T, n_head, -1) for t in (q_raw, k_raw, v_raw))
+    if ve is not None:
+        v = v + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve.view(B, T, n_head, -1)
+    q, k = norm(apply_rotary_emb(q, cos, sin)), norm(apply_rotary_emb(k, cos, sin))
+    return attention(q, k, v, window).contiguous().view(B, T, -1)
 
 
 class FastDUST(DUST):
@@ -655,6 +676,27 @@ class FastDUST(DUST):
                 gradients[site + '.weight'] = self.reassemble(site, error)
         return gradients
 
+    def attention_backward(self, targets):
+        """Errors at q, k, v, gate and value-embedding outputs from each block's exact local attention backward
+        (float32), driven by that block's attention-output error estimate; returned as weight gradients."""
+        cfg = self.model.config
+        cos, sin = self.model.cos[:, :self.length].float(), self.model.sin[:, :self.length].float()
+        gradients = {}
+        for i in range(cfg.n_layer):
+            prefix = f'transformer.h.{i}.attn.'
+            names = [prefix + 'c_q', prefix + 'c_k', prefix + 'c_v']
+            if has_ve(i, cfg.n_layer):
+                names += [prefix + 've_gate', f'value_embeds.{i}']
+            with torch.enable_grad():
+                leaves = [self.outputs[s].detach().float().requires_grad_(True) for s in names]
+                z, ve = (leaves[3], leaves[4]) if len(leaves) == 5 else (None, None)
+                out = _attention_from_outputs(leaves[0], leaves[1], leaves[2], z, ve, cos, sin,
+                                              self.model.window_sizes[i][0], cfg.n_head)
+                errors = torch.autograd.grad(out, leaves, grad_outputs=targets[i].float())
+            for site, error in zip(names, errors):
+                gradients[site + '.weight'] = self.reassemble(site, error)
+        return gradients
+
     def last_block_error(self):
         """d loss_t / d x_out_t at the last block's output, exactly (head error back through the final norm),
         at the draws' reference scale (n - 1) / n."""
@@ -726,7 +768,7 @@ class FastDUST(DUST):
                                                 @ self.modules[prefix + 'attn.c_proj'].weight.float())
 
         site = 'transformer.wte'
-        if o.derive_embedding:
+        if o.derive_embedding or o.scalars_from_errors:
             e_mix = self.mix_errors(writer_errors)
             lam, lam0 = self.model.resid_lambdas.float(), self.model.x0_lambdas.float()
         if o.derive_embedding:  # x0 = norm(e) feeds block 0 (lam_0 x0 + lam0_0 x0) and every mix (lam0_i x0)
@@ -735,6 +777,14 @@ class FastDUST(DUST):
         else:
             error = self.direct_errors([site], r.embedding // world, r.embedding_sigma)[site]
             gradients[site + '.weight'] = self.reassemble(site, error)
+        if o.scalars_from_errors:  # sums over tokens, like the ES estimate; undo the draws' centering shrink
+            n = self.settings.nrep
+            shrink = (n - 1) / n if n > 1 else 1.0
+            previous = [self.x0] + self.out[:-1]
+            gradients['resid_lambdas'] = torch.stack(
+                [(e_mix[i] * previous[i]).sum() for i in range(cfg.n_layer)]) / shrink
+            gradients['x0_lambdas'] = torch.stack(
+                [(e_mix[i] * self.x0).sum() for i in range(cfg.n_layer)]) / shrink
 
         targets = {}
         for layer in range(cfg.n_layer):
@@ -746,17 +796,23 @@ class FastDUST(DUST):
             targets[layer] = average_ranks(self.direct_errors([site], r.hubs[layer] // world, sigma)[site])
 
         gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
-        if o.closed_form_local:
+        if o.closed_form_local and not o.freeze_attention:
             gradients.update(self.closed_form_local_errors(targets))
-        else:
+        elif o.local_attention_backward and not o.freeze_attention:
+            gradients.update(self.attention_backward(targets))
+        elif not o.freeze_attention:
             for kind, count in r.local.items():
                 for site, error in self.local_errors(kind, count // world, targets).items():
                     gradients[site + '.weight'] = self.reassemble(site, error)
-        gradients.update(self.scalar_gradients(8 // world))
+        if not o.freeze_scalars and not o.scalars_from_errors:
+            gradients.update(self.scalar_gradients(8 // world))
 
         valid_tokens = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
         for name, parameter in self.model.named_parameters():
+            if name not in gradients:  # frozen by an A2 option
+                parameter.grad = torch.zeros_like(parameter)
+                continue
             gradient = average_ranks((gradients[name] / valid_tokens).to(parameter.dtype))
             if not torch.isfinite(gradient).all():
                 raise FloatingPointError(f'Non-finite estimate for {name}')
