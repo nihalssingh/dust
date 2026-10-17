@@ -136,7 +136,8 @@ def last_layer_error(model, cap, y):
 
 
 @torch.no_grad()
-def dust_gradients(model, adapters, cap, x, y, draws_per_layer, rel_sigma, generator, exact_last=True):
+def dust_gradients(model, adapters, cap, x, y, draws_per_layer, rel_sigma, generator, exact_last=True,
+                   control_variate=False):
     """Anchored DUST estimates of each layer's output error: independent draws, two per forward, rewarded per
     token with a leave-one-out baseline over the layer's draws; each draw reruns only the later layers."""
     clean = cap.clean(x, y)
@@ -145,8 +146,9 @@ def dust_gradients(model, adapters, cap, x, y, draws_per_layer, rel_sigma, gener
     kw = repeat_kwargs(cap.kwargs, 2)
     y2 = y.repeat(2, 1)
     errors = {}
+    g_last = last_layer_error(model, cap, y) if (exact_last or control_variate) else None
     if exact_last:
-        errors[L - 1] = last_layer_error(model, cap, y)
+        errors[L - 1] = g_last
     adapted = sorted({int(k.split('.')[0]) for k in adapters})
     for l in [l for l in adapted if not (exact_last and l == L - 1)]:
         h = cap.out[l]
@@ -161,11 +163,15 @@ def dust_gradients(model, adapters, cap, x, y, draws_per_layer, rel_sigma, gener
                 z = model.model.layers[j](z, **kw)
                 z = z[0] if isinstance(z, tuple) else z
             change = token_losses(model, z, y2).view(2, B, T) - clean.unsqueeze(0)
+            if control_variate:  # the skip path's part of each token's loss change, known exactly from g_last
+                change = change - sigma * torch.einsum('btd,nbtd->nbt', g_last, a)
             weighted += torch.einsum('nbt,nbtd->btd', change, a)
             noise_sum += a.sum(0)
             change_sum += change.sum(0)
         K = 2 * (draws_per_layer // 2)  # the draws that actually ran
         errors[l] = (weighted - (change_sum / K).unsqueeze(-1) * noise_sum) / ((K - 1) * sigma)
+        if control_variate:
+            errors[l] = errors[l] + g_last
     return clean, errors
 
 
@@ -251,6 +257,8 @@ def main():
     parser.add_argument('--draws-per-layer', type=int, default=2, help='dust: draws per layer (pairs)')
     parser.add_argument('--rel-sigma', type=float, default=0.05, help='dust: noise scale / layer-output RMS')
     parser.add_argument('--no-exact-last', action='store_true', help='dust: estimate the last layer by draws too')
+    parser.add_argument('--control-variate', action='store_true',
+                        help="dust: subtract each draw's skip-path term from the exact last-layer error (A1)")
     parser.add_argument('--mezo-eps', type=float, default=1e-3)
     parser.add_argument('--mezo-pairs', type=int, default=16, help='mezo: +/- pairs per step')
     parser.add_argument('--optimizer', choices=['adam', 'sgd'], default='adam')
@@ -312,7 +320,8 @@ def main():
                 train_loss = loss.item()
             elif args.method == 'dust':
                 clean, errors = dust_gradients(model, adapters, cap, x, y, args.draws_per_layer, args.rel_sigma,
-                                               noise_gen, exact_last=not args.no_exact_last)
+                                               noise_gen, exact_last=not args.no_exact_last,
+                                               control_variate=args.control_variate)
                 mids = mid_errors(model, cap, errors)
                 for key, (gB, gA) in lora_gradients(adapters, cap, errors, mids, y.numel()).items():
                     adapters[key].B.grad, adapters[key].A.grad = gB, gA

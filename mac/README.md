@@ -90,8 +90,8 @@ exactly with an attention whose backward cuts cross-token paths, verified agains
 LoRA adapters sit on each layer's two residual writers (`o_proj`, `down_proj`). An update runs one clean
 forward, then for each adapted layer jitters that layer's output at every token and reruns only the layers
 above it, rewarding each token's jitter by its own loss change with a leave-one-out baseline. The last layer's
-error is exact (a per-token derivative of the final norm, head and cross-entropy),
-`o_proj`'s error comes from `down_proj`'s through the
+error is exact (a per-token derivative of the final norm, head and cross-entropy), `--control-variate`
+subtracts each draw's skip-path term known from it, `o_proj`'s error comes from `down_proj`'s through the
 MLP's exact per-token Jacobian, and the LoRA gradients are outer products with the cached adapter inputs. No
 autograd graph spans more than one layer's MLP. `--layers N` adapts only the top N layers, which makes draws
 much cheaper. `--method backprop [--checkpointing]` and `--method mezo` (two-point weight-space ES) use the

@@ -99,6 +99,22 @@ def main():
     good = sorted(err2) == [1, 2] and cos2 > 0.5
     print(f"{'PASS' if good else 'FAIL'} top-2-layer adapters: anchors {sorted(err2)}, cos with backprop {cos2:.3f}")
     ok &= good
+    # 6) skip-path control variate: unbiased (same mean) and closer to backprop at equal draws
+    flat_c = lambda d: torch.cat([torch.cat([b.flatten(), a.flatten()]) for b, a in d.values()])
+    for draws in (8, 32):
+        cs = {}
+        for cv in (False, True):
+            vals = []
+            for seed in range(4):
+                _, e = dl.dust_gradients(model2, ad2, cap2, x, y, draws, 0.05, torch.Generator().manual_seed(10 + seed),
+                                         control_variate=cv)
+                g = dl.lora_gradients(ad2, cap2, e, dl.mid_errors(model2, cap2, e), y.numel())
+                vals.append(F.cosine_similarity(flat_c(g), flat_c(true2), dim=0).item())
+            cs[cv] = sum(vals) / len(vals)
+        print(f'     draws/layer {draws:3d}: cos without CV {cs[False]:.3f}, with skip CV {cs[True]:.3f}')
+    good = cs[True] >= cs[False] - 0.02
+    print(f"{'PASS' if good else 'FAIL'} skip control variate does not hurt (and should help)")
+    ok &= good
     print('ALL PASSED' if ok else 'SOME FAILED')
     sys.exit(0 if ok else 1)
 
