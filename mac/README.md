@@ -1,7 +1,7 @@
 # DUST on Apple silicon
 
 This branch (`mac-mps`, forked from `qlabs-eng/dust` at `b20f7c0`) runs the paper's code on an Apple-silicon
-Mac and makes it several times cheaper per update.
+Mac, makes it several times cheaper per update, and adds a forward-only LoRA trainer for Hugging Face models.
 Every change is labeled with what it does to the algorithm:
 
 | tier | meaning | how it is verified |
@@ -41,6 +41,9 @@ python fastdust.py --tokens 1M --population 256 --compile --exact-head --derive-
 
 # backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing, --target same-token (analysis)
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
+
+# LoRA fine-tuning of a local Hugging Face model without a backward pass (or backprop/MeZO to compare)
+python mac/dust_lora.py --method dust --model meta-llama/Llama-3.2-1B --steps 60 --output ../runs/lora/dust
 ```
 
 `mac/bench.py` measures any variant's seconds per update, peak memory and cosine with the float32 backprop
@@ -81,6 +84,18 @@ gradient on a fixed batch in about a minute; `mac/run_queue.sh` runs jobs one at
 Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
 exactly with an attention whose backward cuts cross-token paths, verified against brute force;
 `baselines/backprop.py --target same-token` trains on an approximation of it.
+
+### `mac/dust_lora.py`: fine-tuning a Hugging Face model without a backward pass
+
+LoRA adapters sit on each layer's two residual writers (`o_proj`, `down_proj`). An update runs one clean
+forward, then for each adapted layer jitters that layer's output at every token and reruns only the layers
+above it, rewarding each token's jitter by its own loss change with a leave-one-out baseline. The last layer's
+error is exact (a per-token derivative of the final norm, head and cross-entropy),
+`o_proj`'s error comes from `down_proj`'s through the
+MLP's exact per-token Jacobian, and the LoRA gradients are outer products with the cached adapter inputs. No
+autograd graph spans more than one layer's MLP. `--layers N` adapts only the top N layers, which makes draws
+much cheaper. `--method backprop [--checkpointing]` and `--method mezo` (two-point weight-space ES) use the
+same adapters, data and evaluation.
 
 ## Caveats
 

@@ -45,6 +45,18 @@ def runs_table(paths):
     return '\n'.join(out + [r[2] for r in sorted(rows)])
 
 
+def lora_table(paths):
+    out = ['| run | method | s / step | peak GB | held-out loss start -> end |', '|---|---|---|---|---|']
+    for run in paths:
+        f = run / 'result.json'
+        if not f.exists():
+            continue
+        r = json.loads(f.read_text())
+        out.append(f"| {run.name} | {r['method']} | {r['seconds_per_step']:.2f} | {r['peak_memory_gb']:.1f} | "
+                   f"{r['history'][0]['eval_loss']:.4f} -> {r['final_eval']:.4f} |")
+    return '\n'.join(out)
+
+
 def main(root):
     root = Path(root)
     v2 = root / 'bench' / 'v2'
@@ -61,6 +73,9 @@ def main(root):
         for k, v in json.loads(mem.read_text()).items():
             print(f'| {k} | {v:.2f} |')
         print()
+    lora = sorted(p for p in (root / 'lora').glob('*') if p.is_dir())
+    if lora:
+        print('### LoRA fine-tuning of Llama-3.2-1B on tiny-shakespeare\n\n' + lora_table(lora))
 
 
 if __name__ == '__main__':
