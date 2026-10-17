@@ -7,7 +7,7 @@ Every change is labeled with what it does to the algorithm:
 | tier | meaning | how it is verified |
 |---|---|---|
 | **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | bit-for-bit against `dust.py` on CPU in float32 with the same noise (`mac/test_fastdust.py`), and the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
-| **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged |
+| **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged (`mac/bench.py`) |
 | **A1**, algorithmic, same target | a different estimator of the same expected update (the paper's same-token target), with less variance or cost | expectation checks against exact targets, then cosine and training loss |
 | **A2**, approximation | changes what is estimated (biased, reduced or hybrid) | cosine and training loss; the bias is stated |
 
@@ -42,6 +42,9 @@ python fastdust.py --tokens 1M --population 256 --compile --exact-head --derive-
 # backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing, --target same-token (analysis)
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
 ```
+
+`mac/bench.py` measures any variant's seconds per update, peak memory and cosine with the float32 backprop
+gradient on a fixed batch in about a minute; `mac/run_queue.sh` runs jobs one at a time (with `caffeinate`).
 
 ## The changes
 
