@@ -1,12 +1,12 @@
 # DUST on Apple silicon
 
 This branch (`mac-mps`, forked from `qlabs-eng/dust` at `b20f7c0`) runs the paper's code on an Apple-silicon
-Mac.
+Mac and makes it several times cheaper per update.
 Every change is labeled with what it does to the algorithm:
 
 | tier | meaning | how it is verified |
 |---|---|---|
-| **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
+| **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | bit-for-bit against `dust.py` on CPU in float32 with the same noise (`mac/test_fastdust.py`), and the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
 | **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged |
 
 Tested on a MacBook Pro (M5, 10-core, 24 GB unified memory), macOS 26, PyTorch 2.14.1.
@@ -17,6 +17,7 @@ Tested on a MacBook Pro (M5, 10-core, 24 GB unified memory), macOS 26, PyTorch 2
 uv venv --python 3.12 ../.venv
 uv pip install --python ../.venv/bin/python torch==2.14.1 tokenizers==0.23.1 datasets==4.8.4
 ../.venv/bin/python prepare_data.py --output ../data      # streams FineWeb, about a minute
+../.venv/bin/python mac/test_fastdust.py                   # exactness tests, CPU
 ```
 
 PyTorch 2.14 matters: its MPS attention kernel is about 16x faster than 2.10's for this model (sliding-window
@@ -27,6 +28,9 @@ SDPA at batch 8: 97 ms in 2.10, 6 ms in 2.14).
 ```bash
 # the paper's code, on MPS (bf16 autocast like the paper's CUDA runs), compiled
 python dust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/ref
+
+# the same estimator, faster (tiers E + N)
+python fastdust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/exact
 
 # backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing, --target same-token (analysis)
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
@@ -42,6 +46,13 @@ python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output .
 | full-window attention via `is_causal` | E | the window covers the sequence, so the mask is exactly causal |
 | sliding-window attention in query chunks of 256, each against only its in-window keys | E | bitwise identical on MPS; 1.8x faster for the six windowed blocks |
 | `torch.compile` (`--compile`) | N | 2x; cosines with the true gradient unchanged |
+
+### `fastdust.py` options
+
+| option | tier | what it does |
+|---|---|---|
+| `truncate` (default) | E | a draw that jitters block l reruns only from the jittered module onward, from cached clean activations |
+| (functional forward, per-chunk local/head kernels, native-dtype caches) | E / N when compiled | same math, fewer passes and less memory |
 
 Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
 exactly with an attention whose backward cuts cross-token paths, verified against brute force;
