@@ -9,19 +9,37 @@ from torch.nn import functional as F
 BF16_DEVICES = ('cuda', 'mps')
 
 
+# Sliding-window attention runs in chunks of this many queries, each against only its in-window keys. A [T, T]
+# mask makes the MPS kernel visit every key tile, masked or not; chunking skips the fully masked ones. Same
+# results (bitwise on MPS in mac/window_attention_bench.py), about 1.8x faster for window 1024. 0 disables.
+WINDOW_CHUNK = 256
+
+
 def attention(q, k, v, window):
     """Causal attention with a left window; tensors have shape [batch, token, head, dim].
 
-    A query at position s sees keys at s - window to s.
+    A query at position s sees keys at s - window to s. When the window covers the whole sequence the
+    mask is exactly the causal mask, so is_causal is used (it is much faster on MPS).
     """
     length = q.shape[1]
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    if window >= length - 1:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
     positions = torch.arange(length, device=q.device)
-    distance = positions[:, None] - positions[None, :]
-    mask = (distance >= 0) & (distance <= window)
-    out = F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask,
-    )
-    return out.transpose(1, 2)
+    if not WINDOW_CHUNK or length <= WINDOW_CHUNK:
+        distance = positions[:, None] - positions[None, :]
+        mask = (distance >= 0) & (distance <= window)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
+    outs = []
+    for start in range(0, length, WINDOW_CHUNK):
+        stop = min(length, start + WINDOW_CHUNK)
+        first = max(0, start - window)
+        distance = positions[start:stop, None] - positions[None, first:stop]
+        mask = (distance >= 0) & (distance <= window)
+        outs.append(F.scaled_dot_product_attention(
+            q[:, :, start:stop], k[:, :, first:stop], v[:, :, first:stop], attn_mask=mask,
+        ))
+    return torch.cat(outs, dim=2).transpose(1, 2)
 
 
 @dataclass

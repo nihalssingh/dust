@@ -6,6 +6,7 @@ Every change is labeled with what it does to the algorithm:
 
 | tier | meaning | how it is verified |
 |---|---|---|
+| **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
 | **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged |
 
 Tested on a MacBook Pro (M5, 10-core, 24 GB unified memory), macOS 26, PyTorch 2.14.1.
@@ -30,8 +31,10 @@ python dust.py --tokens 1M --population 256 --data-dir ../data --output ../runs/
 
 ## The changes
 
-### Port (N)
+### Port (E/N)
 
 | change | tier | notes |
 |---|---|---|
 | CUDA-or-MPS device selection, bf16 autocast and bf16 embedding storage on MPS | N | mirrors the paper's CUDA setup |
+| full-window attention via `is_causal` | E | the window covers the sequence, so the mask is exactly causal |
+| sliding-window attention in query chunks of 256, each against only its in-window keys | E | bitwise identical on MPS; 1.8x faster for the six windowed blocks |
