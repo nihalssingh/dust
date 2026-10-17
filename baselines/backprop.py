@@ -11,6 +11,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dust import GPTConfig, evaluate, file_hash, load_sequences, make_model
+from model import BF16_DEVICES
 
 
 DEFAULT_CONFIGS = {
@@ -30,7 +31,7 @@ def make_optimizer(model, lr, momentum):
 
 def train_step(model, optimizer, x, y):
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.is_cuda):
+    with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.device.type in BF16_DEVICES):
         loss = model(x, y)
     if not torch.isfinite(loss):
         raise FloatingPointError('Non-finite backpropagation loss')
@@ -51,20 +52,30 @@ def main():
     parser.add_argument('--lr', type=float, help='Override the base learning rate for the selected token budget.')
     parser.add_argument('--momentum', type=float, help='Override SGD momentum for the selected token budget.')
     parser.add_argument('--steps', type=int, help='Stop early; keep the full selected training subset.')
+    parser.add_argument(
+        '--device', choices=['cuda', 'mps'],
+        help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
+    )
     args = parser.parse_args()
     defaults = DEFAULT_CONFIGS[args.tokens]
     args.lr = defaults['lr'] if args.lr is None else args.lr
     args.momentum = defaults['momentum'] if args.momentum is None else args.momentum
 
-    if not torch.cuda.is_available():
-        parser.error('Training requires a CUDA GPU.')
     if int(os.environ.get('WORLD_SIZE', 1)) != 1:
         parser.error('This baseline uses one GPU; launch it with python, not torchrun.')
     if args.lr <= 0 or not 0 <= args.momentum < 1:
         parser.error('Use a positive learning rate and momentum in [0, 1).')
-    device = torch.device('cuda', 0)
-    torch.cuda.set_device(device)
-    torch.set_float32_matmul_precision('high')
+    device_type = args.device or (
+        'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else None
+    )
+    if device_type == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda', 0)
+        torch.cuda.set_device(device)
+        torch.set_float32_matmul_precision('high')
+    elif device_type == 'mps' and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        parser.error('Training requires a CUDA GPU or an Apple GPU (MPS).')
 
     config = GPTConfig()
     steps = defaults['steps']
@@ -96,6 +107,7 @@ def main():
     metadata = dict(
         method='backprop', tokens=args.tokens, seed=args.seed, steps=steps,
         lr=args.lr, momentum=args.momentum, weight_decay=0.0,
+        device=device.type,
         training_tokens=steps * 8 * config.sequence_len,
         validation_sequences=544, test_sequences=544, model=asdict(config),
         parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],

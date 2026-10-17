@@ -26,7 +26,7 @@ import time
 import torch
 from torch import nn
 
-from model import GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
+from model import BF16_DEVICES, GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
 
 
 @dataclass
@@ -113,7 +113,7 @@ class DUST:
     def __init__(self, model, settings, seed=42, rank=0, world=1):
         self.model, self.settings, self.world = model, settings, world
         self.device = next(model.parameters()).device
-        self.dtype = torch.bfloat16 if self.device.type == 'cuda' else torch.float32
+        self.dtype = torch.bfloat16 if self.device.type in BF16_DEVICES else torch.float32
         self.generator = torch.Generator(self.device).manual_seed(seed + 3 + 7777 * rank)
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
         self.inputs, self.outputs, self.jitter = {}, {}, {}
@@ -133,7 +133,7 @@ class DUST:
             self.hooks.append(module.register_forward_pre_hook(self.input_hook(f'o@{layer}')))
 
     def autocast(self):
-        return torch.autocast('cuda', dtype=self.dtype) if self.device.type == 'cuda' else nullcontext()
+        return torch.autocast(self.device.type, dtype=self.dtype) if self.device.type in BF16_DEVICES else nullcontext()
 
     def output_hook(self, name):
         def hook(module, args, output):
@@ -424,7 +424,7 @@ def evaluate(model, rows, device, batch_size=32):
     for batch in rows.split(batch_size):
         batch = batch.to(device)
         x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
-        context = torch.autocast('cuda', dtype=torch.bfloat16) if device.type == 'cuda' else nullcontext()
+        context = torch.autocast(device.type, dtype=torch.bfloat16) if device.type in BF16_DEVICES else nullcontext()
         with context:
             loss = model(x, y)
         if not torch.isfinite(loss):
@@ -489,16 +489,28 @@ def main():
         '--steps', type=int,
         help='Stop early for a smoke test; the training subset stays unchanged.',
     )
+    parser.add_argument(
+        '--device', choices=['cuda', 'mps'],
+        help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
+    )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        parser.error('Training requires a CUDA GPU.')
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
-    device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
-    torch.cuda.set_device(device)
-    torch.set_float32_matmul_precision('high')
-    if world > 1:
-        torch.distributed.init_process_group('nccl', device_id=device)
+    device_type = args.device or (
+        'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else None
+    )
+    if device_type == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
+        torch.cuda.set_device(device)
+        torch.set_float32_matmul_precision('high')
+        if world > 1:
+            torch.distributed.init_process_group('nccl', device_id=device)
+    elif device_type == 'mps' and torch.backends.mps.is_available():
+        if world > 1:
+            parser.error('MPS runs on one device; launch with python, not torchrun.')
+        device = torch.device('mps')
+    else:
+        parser.error('Training requires a CUDA GPU or an Apple GPU (MPS).')
 
     settings = recipe(args.tokens, args.population)
     defaults = DEFAULT_CONFIGS[args.tokens]
@@ -553,6 +565,7 @@ def main():
         source_sha256=file_hash(Path(__file__)),
         model_sha256=file_hash(Path(__file__).parent / 'model.py'),
         torch_version=torch.__version__,
+        device=device.type,
     )
     if rank == 0:
         metadata['data_sha256'] = {k: file_hash(v) for k, v in paths.items()}

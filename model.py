@@ -5,6 +5,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+# Devices that run the forward in bfloat16 and store token/value embeddings in bfloat16.
+BF16_DEVICES = ('cuda', 'mps')
+
 
 def attention(q, k, v, window):
     """Causal attention with a left window; tensors have shape [batch, token, head, dim].
@@ -160,7 +163,7 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         (self.cos, self.sin) = (cos, sin)
         # Token and value embeddings are stored in bfloat16 on the GPU
-        if self.transformer.wte.weight.device.type == 'cuda':
+        if self.transformer.wte.weight.device.type in BF16_DEVICES:
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
