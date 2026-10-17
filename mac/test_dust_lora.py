@@ -115,6 +115,32 @@ def main():
     good = cs[True] >= cs[False] - 0.02
     print(f"{'PASS' if good else 'FAIL'} skip control variate does not hurt (and should help)")
     ok &= good
+    # 7) bottleneck DUST (frozen B): its A-gradient aligns with backprop's and improves with draws
+    model3 = LlamaForCausalLM(cfg).float().eval().requires_grad_(False)
+    ad3 = dl.add_lora(model3, rank=4, alpha=8, frozen_b=True)
+    cap3 = dl.Capture(model3)
+    for a in ad3.values():
+        a.A.requires_grad_(True)
+    dl.token_losses(model3, model3.model(input_ids=x, use_cache=False).last_hidden_state, y, normed=True).mean().backward()
+    trueA = torch.cat([a.A.grad.flatten() for a in ad3.values()])
+    for a in ad3.values():
+        a.A.requires_grad_(False)
+        a.A.grad = None
+    last = {}
+    for cv in (False, True):
+        line = f'     bottleneck {"with" if cv else "no  "} CV:'
+        for draws in (8, 64):
+            vals = []
+            for seed in range(3):
+                _, g = dl.bottleneck_gradients(model3, ad3, cap3, x, y, draws, 0.05, torch.Generator().manual_seed(20 + seed),
+                                               control_variate=cv)
+                vals.append(F.cosine_similarity(torch.cat([g[k][1].flatten() for k in ad3]), trueA, dim=0).item())
+            last[(cv, draws)] = sum(vals) / len(vals)
+            line += f'  {draws:3d} draws cos {last[(cv, draws)]:.3f}'
+        print(line)
+    good = last[(True, 64)] > 0.5 and last[(True, 64)] > last[(True, 8)]
+    print(f"{'PASS' if good else 'FAIL'} bottleneck DUST aligns with backprop's A-gradient")
+    ok &= good
     print('ALL PASSED' if ok else 'SOME FAILED')
     sys.exit(0 if ok else 1)
 

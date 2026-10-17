@@ -31,27 +31,38 @@ DATA = Path(__file__).resolve().parents[2] / 'data' / 'shakespeare' / 'input.txt
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, base, rank, alpha):
+    """y = W x + scale * B (A x). Standard init: A random, B zero. frozen_b: B a fixed random orthonormal basis
+    and A zero (only A trains), so the bottleneck z = A x can be jittered (`jitter`, [batch, tokens, rank])."""
+
+    def __init__(self, base, rank, alpha, frozen_b=False):
         super().__init__()
         self.base = base
-        self.A = nn.Parameter(torch.randn(rank, base.in_features, dtype=torch.float32) / math.sqrt(base.in_features))
-        self.B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32))
         self.scale = alpha / rank
+        self.jitter = None
+        if frozen_b:
+            q, _ = torch.linalg.qr(torch.randn(base.out_features, rank, dtype=torch.float32))
+            self.A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=torch.float32))
+            self.B = nn.Parameter(q, requires_grad=False)
+        else:
+            self.A = nn.Parameter(torch.randn(rank, base.in_features, dtype=torch.float32) / math.sqrt(base.in_features))
+            self.B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32))
 
     def forward(self, x):
-        delta = F.linear(F.linear(x.float(), self.A), self.B) * self.scale
-        return self.base(x) + delta.to(x.dtype)
+        z = F.linear(x.float(), self.A)
+        if self.jitter is not None:
+            z = z + self.jitter
+        return self.base(x) + (F.linear(z, self.B) * self.scale).to(x.dtype)
 
 
-def add_lora(model, rank, alpha, layers=None):
+def add_lora(model, rank, alpha, layers=None, frozen_b=False):
     """Adapters on o_proj and down_proj of the top `layers` layers (all layers by default)."""
     adapters = {}
     first = 0 if layers is None else len(model.model.layers) - layers
     for i, layer in enumerate(model.model.layers):
         if i < first:
             continue
-        layer.self_attn.o_proj = LoRALinear(layer.self_attn.o_proj, rank, alpha)
-        layer.mlp.down_proj = LoRALinear(layer.mlp.down_proj, rank, alpha)
+        layer.self_attn.o_proj = LoRALinear(layer.self_attn.o_proj, rank, alpha, frozen_b)
+        layer.mlp.down_proj = LoRALinear(layer.mlp.down_proj, rank, alpha, frozen_b)
         adapters[f'{i}.o'] = layer.self_attn.o_proj
         adapters[f'{i}.down'] = layer.mlp.down_proj
     return adapters
@@ -175,6 +186,57 @@ def dust_gradients(model, adapters, cap, x, y, draws_per_layer, rel_sigma, gener
     return clean, errors
 
 
+@torch.no_grad()
+def bottleneck_gradients(model, adapters, cap, x, y, draws, rel_sigma, generator, control_variate=True):
+    """A2 "bottleneck" DUST for frozen-B adapters: every adapter's rank-r bottleneck z = A x is jittered at every
+    token, jointly, and each token's jitter is rewarded by its own loss change (leave-one-out baseline over the
+    draws). That estimates dL/dz, so dL/dA = sum_t dL/dz_t x_t^T. Noise lives in r dimensions per adapter
+    instead of the layer width. With control_variate, each adapter's skip-path term scale B^T g_last (from the
+    exact last-layer error) is subtracted from every token's loss change and added back."""
+    clean = cap.clean(x, y)
+    L = len(model.model.layers)
+    B, T = y.shape
+    g_last = last_layer_error(model, cap, y) if control_variate else None
+    sig, known = {}, {}
+    for key, ad in adapters.items():
+        layer = int(key.split('.')[0])
+        width = cap.out[layer].float().pow(2).mean().sqrt().item()  # residual-stream RMS where y lands
+        # per-coordinate jitter in the residual stream of rel_sigma x its RMS in total, split over all adapters
+        sig[key] = rel_sigma * width * math.sqrt(ad.B.shape[0] / ad.B.shape[1]) / ad.scale / math.sqrt(len(adapters))
+        if control_variate:
+            known[key] = ad.scale * g_last @ ad.B  # [B, T, r]
+    r = next(iter(adapters.values())).B.shape[1]
+    weighted = {k: torch.zeros(B, T, r, device=y.device) for k in adapters}
+    noise_sum = {k: torch.zeros(B, T, r, device=y.device) for k in adapters}
+    change_sum = torch.zeros(B, T, device=y.device)
+    x2, y2 = x.repeat(2, 1), y.repeat(2, 1)
+    try:
+        for _ in range(draws // 2):
+            noise = {k: torch.randn(2, B, T, r, device=y.device, generator=generator) for k in adapters}
+            for k, ad in adapters.items():
+                ad.jitter = (sig[k] * noise[k]).flatten(0, 1)
+            hidden = model.model(input_ids=x2, use_cache=False).last_hidden_state
+            change = token_losses(model, hidden, y2, normed=True).view(2, B, T) - clean.unsqueeze(0)
+            for k in known:
+                change = change - sig[k] * torch.einsum('btr,nbtr->nbt', known[k], noise[k])
+            change_sum += change.sum(0)
+            for k in adapters:
+                weighted[k] += torch.einsum('nbt,nbtr->btr', change, noise[k])
+                noise_sum[k] += noise[k].sum(0)
+    finally:
+        for ad in adapters.values():
+            ad.jitter = None
+    K = 2 * (draws // 2)
+    grads = {}
+    for k, ad in adapters.items():
+        dz = (weighted[k] - (change_sum / K).unsqueeze(-1) * noise_sum[k]) / ((K - 1) * sig[k])
+        if control_variate:
+            dz = dz + known[k]
+        xin = cap.inp[k].float().flatten(0, 1)
+        grads[k] = (torch.zeros_like(ad.B), dz.flatten(0, 1).T @ xin / y.numel())
+    return clean, grads
+
+
 def mid_errors(model, cap, errors):
     """Error at x_mid (o_proj's output) = e_out + (d MLP(norm(x_mid)) / d x_mid)^T e_out, per token."""
     out = {}
@@ -244,7 +306,9 @@ class PeakMemory:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--method', choices=['dust', 'backprop', 'mezo'], required=True)
+    parser.add_argument('--method', choices=['dust', 'dust-bottleneck', 'backprop', 'mezo'], required=True)
+    parser.add_argument('--frozen-b', action='store_true',
+                        help='adapters with a fixed random orthonormal B and A from zero (implied by dust-bottleneck)')
     parser.add_argument('--model', default='meta-llama/Llama-3.2-1B')
     parser.add_argument('--data', type=Path, default=DATA)
     parser.add_argument('--steps', type=int, default=100)
@@ -269,7 +333,7 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    if args.method == 'dust' and (args.draws_per_layer < 2 or args.draws_per_layer % 2):
+    if args.method in ('dust', 'dust-bottleneck') and (args.draws_per_layer < 2 or args.draws_per_layer % 2):
         parser.error('--draws-per-layer must be even and at least 2 (two draws per forward, leave-one-out baseline)')
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -283,9 +347,10 @@ def main():
                              for i in range(min(args.eval_seqs, (len(held) - 1) // args.seq))])
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, attn_implementation='sdpa').to(device)
     model.requires_grad_(False)
-    adapters = add_lora(model, args.rank, args.alpha, args.layers)
+    frozen_b = args.frozen_b or args.method == 'dust-bottleneck'
+    adapters = add_lora(model, args.rank, args.alpha, args.layers, frozen_b)
     model.to(device)
-    params = [p for ad in adapters.values() for p in (ad.A, ad.B)]
+    params = [p for ad in adapters.values() for p in ((ad.A,) if frozen_b else (ad.A, ad.B))]
     for p in params:  # only backprop needs autograd on the adapters
         p.requires_grad_(args.method == 'backprop')
     if args.method == 'backprop':
@@ -299,7 +364,7 @@ def main():
         opt = torch.optim.SGD(params, lr=args.lr, momentum=args.momentum)
     gen = torch.Generator().manual_seed(args.seed)
     noise_gen = torch.Generator(device).manual_seed(args.seed + 1)
-    cap = Capture(model) if args.method == 'dust' else None
+    cap = Capture(model) if args.method in ('dust', 'dust-bottleneck') else None
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'config.json').write_text(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=1))
     history = [dict(step=0, eval_loss=evaluate(model, eval_rows, device), seconds=0.0)]
@@ -327,6 +392,13 @@ def main():
                     adapters[key].B.grad, adapters[key].A.grad = gB, gA
                 train_loss = clean.mean().item()
                 del clean, errors, mids  # keep only what the next step needs
+            elif args.method == 'dust-bottleneck':
+                clean, grads = bottleneck_gradients(model, adapters, cap, x, y, args.draws_per_layer, args.rel_sigma,
+                                                    noise_gen, control_variate=args.control_variate)
+                for key, (_, gA) in grads.items():
+                    adapters[key].A.grad = gA
+                train_loss = clean.mean().item()
+                del clean, grads
             else:  # MeZO: projected two-point estimates along random directions of all LoRA parameters
                 with torch.no_grad():
                     grads = [torch.zeros_like(p) for p in params]
