@@ -28,7 +28,7 @@ SDPA at batch 8: 97 ms in 2.10, 6 ms in 2.14).
 # the paper's code, on MPS (bf16 autocast like the paper's CUDA runs), compiled
 python dust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/ref
 
-# backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing
+# backprop baselines: SGD (default), --optimizer adam|adamw, --checkpointing, --target same-token (analysis)
 python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
 ```
 
@@ -42,6 +42,10 @@ python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output .
 | full-window attention via `is_causal` | E | the window covers the sequence, so the mask is exactly causal |
 | sliding-window attention in query chunks of 256, each against only its in-window keys | E | bitwise identical on MPS; 1.8x faster for the six windowed blocks |
 | `torch.compile` (`--compile`) | N | 2x; cosines with the true gradient unchanged |
+
+Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
+exactly with an attention whose backward cuts cross-token paths, verified against brute force;
+`baselines/backprop.py --target same-token` trains on an approximation of it.
 
 ## Caveats
 

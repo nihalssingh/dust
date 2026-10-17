@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac'))
 from dust import GPTConfig, compile_model, evaluate, file_hash, load_sequences, make_model
 from model import BF16_DEVICES, norm
 
@@ -70,6 +71,30 @@ def checkpointed_forward(model, idx, targets):
     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
 
+def same_token_step(model, optimizer, x, y):
+    """Analysis only: an SGD step on (approximately) DUST's infinite-population target. Every direct-loss site
+    gets the same-token gradient (each token's activation credited only with its own loss) from one backward
+    pass with all cross-token paths cut; the attention internals (q, k, v, gate, value embeddings) take the
+    full gradient from a second, ordinary pass instead of eight per-block passes (approximation), as do the
+    residual scalars, whose weight-space ES targets the full gradient."""
+    import cosine_probe
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.device.type in BF16_DEVICES):
+        grads, _ = cosine_probe.backprop(model, x, y, first_diagonal=0)
+        full, _ = cosine_probe.backprop(model, x, y)
+        for name, g in full.items():
+            if ('attn.' in name and 'c_proj' not in name) or 'value_embeds' in name or 'lambdas' in name:
+                grads[name] = g  # DUST's local draws and scalar ES target these through the full gradient
+        with torch.no_grad():
+            loss = model(x, y)
+    for name, parameter in model.named_parameters():
+        parameter.grad = grads[name].to(parameter.dtype)
+        if not torch.isfinite(parameter.grad).all():
+            raise FloatingPointError(f'Non-finite same-token gradient for {name}')
+    optimizer.step()
+    return loss.item()
+
+
 def train_step(model, optimizer, x, y, checkpointing=False):
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.device.type in BF16_DEVICES):
@@ -101,6 +126,11 @@ def main():
     parser.add_argument('--weight-decay', type=float, default=0.0, help='Matrix weight decay (adam/adamw only).')
     parser.add_argument('--checkpointing', action='store_true', help='Recompute each block during backward.')
     parser.add_argument('--compile', action='store_true', help='torch.compile the model.')
+    parser.add_argument(
+        '--target', choices=['full', 'same-token'], default='full',
+        help="same-token: analysis run on an approximation of DUST's infinite-population target (2 backward passes "
+             'per step).',
+    )
     parser.add_argument(
         '--device', choices=['cuda', 'mps'],
         help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
@@ -155,7 +185,10 @@ def main():
     steps = args.steps or steps
 
     model = make_model(config, device, args.seed).requires_grad_(True)
-    if args.compile:
+    eval_model = model
+    if args.compile and args.target == 'same-token':
+        eval_model = torch.compile(model)  # training passes swap the attention function, so stay eager there
+    elif args.compile:
         compile_model(model)
     if args.optimizer == 'sgd':
         optimizer = make_optimizer(model, args.lr, args.momentum)
@@ -168,7 +201,7 @@ def main():
         method='backprop', tokens=args.tokens, seed=args.seed, steps=steps,
         optimizer=args.optimizer, lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay if args.optimizer != 'sgd' else 0.0,
-        checkpointing=args.checkpointing, device=device.type, compiled=args.compile,
+        checkpointing=args.checkpointing, device=device.type, compiled=args.compile, target=args.target,
         training_tokens=steps * 8 * config.sequence_len,
         validation_sequences=544, test_sequences=544, model=asdict(config),
         parameter_groups=[dict(lr=g['lr'], momentum=g.get('momentum'), betas=g.get('betas'),
@@ -182,7 +215,7 @@ def main():
     )
     (args.output / 'config.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
-    best = evaluate(model, validation, device)
+    best = evaluate(eval_model, validation, device)
 
     def save_best():
         torch.save(
@@ -198,12 +231,15 @@ def main():
 
     for step in range(1, steps + 1):
         batch = training[(step - 1) * 8:step * 8].to(device)
-        loss = train_step(
-            model, optimizer, batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), args.checkpointing,
-        )
+        if args.target == 'same-token':
+            loss = same_token_step(model, optimizer, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
+        else:
+            loss = train_step(
+                model, optimizer, batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), args.checkpointing,
+            )
         record = dict(step=step, train_loss=loss, elapsed_seconds=time.monotonic() - start)
         if step == 1 or step % interval == 0 or step == steps:
-            value = evaluate(model, validation, device)
+            value = evaluate(eval_model, validation, device)
             record['val_loss'] = value
             if value < best:
                 best = value
