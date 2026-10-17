@@ -40,8 +40,10 @@ class Recipe:
     local: dict[str, int]   # draws per block for each attention internal: q, v, gate, k, ve
     nrep: int               # draws run together in one forward pass
     lr: float
-    momentum: float
+    momentum: float         # SGD momentum, or Adam's beta1
     gamma: float = 0.98  # attention-internal credit decay per token of lag
+    optimizer: str = 'sgd'
+    embedding_sigma: float = 0.2  # noise scale of the token-embedding draws
 
 
 DEFAULT_CONFIGS = {
@@ -75,9 +77,20 @@ DEFAULT_CONFIGS = {
 # Draws per forward pass (the batch is repeated this many times).
 DRAW_CHUNK_SIZES = {256: 2, 1024: 8, 4096: 8, 16384: 16}
 
+# Adam ladder at 1M tokens (paper Appendix E Table 3 and Appendix F Table 7). Table 3 gives the Adam stream
+# totals at K = 16,384 (writer pair 4,096, MLP 4,096, attention outputs 6,144, embedding 8,192 at noise 0.4,
+# head 49,152), adding up to 11K/8 loss-rewarded draws. The paper does not give the Adam per-block split, so
+# the SGD tilt is rescaled to those totals and rounded to the draw chunk: an assumption of this port.
+ADAM_RECIPE = dict(
+    writers=[22, 18, 8, 6, 4, 2, 2, 2], hubs=[22, 22, 14, 8, 8, 8, 8, 6], embedding=128, head_per_draw=3,
+    embedding_sigma=0.4, lr={256: 0.0015, 1024: 0.0015, 4096: 0.0015, 16384: 0.002}, beta1=0.7,
+)
 
-def recipe(tokens, population):
+
+def recipe(tokens, population, optimizer_name='sgd'):
     """Build a saved config, population counts direct-loss draws only. """
+    if optimizer_name == 'adam':
+        return adam_recipe(population)
     optimizer = DEFAULT_CONFIGS[tokens]['optimizer'][population]
     nrep = DRAW_CHUNK_SIZES[population]
     scale = population // 256
@@ -91,6 +104,19 @@ def recipe(tokens, population):
         writers, hidden, hubs, embedding, 4 * population,
         dict(zip(('q', 'v', 'gate', 'k', 've'), local)),
         nrep, **optimizer, gamma=override.get('gamma', 0.98),
+    )
+
+
+def adam_recipe(population):
+    """The Adam ladder's allocation (11/8 of the population is loss-rewarded) with Dust's Table 7 settings."""
+    a, scale = ADAM_RECIPE, population // 256
+    writers = [v * scale for v in a['writers']]
+    local = [v * scale for v in [2, 20, 6, 12, 8]]
+    return Recipe(
+        writers, writers.copy(), [v * scale for v in a['hubs']], a['embedding'] * scale,
+        a['head_per_draw'] * population, dict(zip(('q', 'v', 'gate', 'k', 've'), local)),
+        DRAW_CHUNK_SIZES[population], lr=a['lr'][population], momentum=a['beta1'],
+        optimizer='adam', embedding_sigma=a['embedding_sigma'],
     )
 
 
@@ -367,7 +393,7 @@ class DUST:
                     gradients[site + '.weight'] = self.reassemble(site, error)
 
         site = 'transformer.wte'
-        error = self.direct_errors([site], r.embedding // world, 0.2)[site]
+        error = self.direct_errors([site], r.embedding // world, r.embedding_sigma)[site]
         gradients[site + '.weight'] = self.reassemble(site, error)
 
         # Attention outputs, each block alone. The deeper half moves the loss too little at 0.2 for a readable
@@ -460,6 +486,21 @@ def compile_model(model):
 
 
 def make_optimizer(model, settings):
+    if settings.optimizer == 'adam':
+        # Table 7: matrices and head at the base rate, token and value embeddings at 300x, residual scalars at
+        # 100x; beta2 0.95, eps 1e-8, no weight decay.
+        groups = {}
+        for name, parameter in model.named_parameters():
+            lr = settings.lr
+            if name == 'transformer.wte.weight' or 'value_embeds' in name:
+                lr = 300 * settings.lr
+            elif 'lambdas' in name:
+                lr = 100 * settings.lr
+            groups.setdefault(lr, []).append(parameter)
+        return torch.optim.Adam(
+            [{'params': ps, 'lr': lr} for lr, ps in groups.items()],
+            betas=(settings.momentum, 0.95), eps=1e-8, weight_decay=0.0,
+        )
     groups = {}
     for name, parameter in model.named_parameters():
         lr = settings.lr
@@ -499,6 +540,12 @@ def main():
         help='Stop early for a smoke test; the training subset stays unchanged.',
     )
     parser.add_argument(
+        '--optimizer', choices=['sgd', 'adam'], default='sgd',
+        help="adam uses the paper's 1M-token Adam ladder settings (Appendix E Table 3, Appendix F Table 7).",
+    )
+    parser.add_argument('--lr', type=float, help='Override the tuned base learning rate.')
+    parser.add_argument('--momentum', type=float, help='Override the tuned momentum (Adam: beta1).')
+    parser.add_argument(
         '--device', choices=['cuda', 'mps'],
         help='Default: CUDA when available, otherwise the Apple GPU (MPS).',
     )
@@ -522,7 +569,11 @@ def main():
     else:
         parser.error('Training requires a CUDA GPU or an Apple GPU (MPS).')
 
-    settings = recipe(args.tokens, args.population)
+    settings = recipe(args.tokens, args.population, args.optimizer)
+    if args.lr is not None:
+        settings.lr = args.lr
+    if args.momentum is not None:
+        settings.momentum = args.momentum
     defaults = DEFAULT_CONFIGS[args.tokens]
     config = GPTConfig()
     steps = defaults['steps']
@@ -571,7 +622,7 @@ def main():
         model=asdict(config),
         recipe=asdict(settings),
         reward_centering='per-token local draw-chunk mean; skipped at nrep=1; no rescaling',
-        parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],
+        parameter_groups=[dict(lr=g['lr'], momentum=g.get('momentum'), betas=g.get('betas'),
                                parameters=sum(p.numel() for p in g['params']))
                           for g in optimizer.param_groups],
         source_sha256=file_hash(Path(__file__)),

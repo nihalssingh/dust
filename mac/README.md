@@ -27,6 +27,9 @@ SDPA at batch 8: 97 ms in 2.10, 6 ms in 2.14).
 ```bash
 # the paper's code, on MPS (bf16 autocast like the paper's CUDA runs), compiled
 python dust.py --tokens 1M --population 256 --compile --data-dir ../data --output ../runs/ref
+
+# backprop baselines: SGD (default), --optimizer adam|adamw
+python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output ../runs/bp
 ```
 
 ## The changes
@@ -39,3 +42,8 @@ python dust.py --tokens 1M --population 256 --compile --data-dir ../data --outpu
 | full-window attention via `is_causal` | E | the window covers the sequence, so the mask is exactly causal |
 | sliding-window attention in query chunks of 256, each against only its in-window keys | E | bitwise identical on MPS; 1.8x faster for the six windowed blocks |
 | `torch.compile` (`--compile`) | N | 2x; cosines with the true gradient unchanged |
+
+## Caveats
+
+- The paper does not give the per-block split of its Adam allocation; `dust.py --optimizer adam` rescales the
+  SGD split to the paper's Adam totals (an assumption).

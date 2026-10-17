@@ -19,6 +19,29 @@ DEFAULT_CONFIGS = {
     '10M': dict(lr=0.2, momentum=0.95, steps=610, eval_interval=10),
 }
 
+# Backprop's Adam settings at 1M tokens (paper Appendix F, Table 7): matrices and head 0.002, token and value
+# embeddings 0.3, residual scalars 0.2, beta1 0.8, beta2 0.95, eps 1e-8, no weight decay. --lr scales all three.
+ADAM_DEFAULTS = dict(lr=0.002, embedding_lr=0.3, scalar_lr=0.2, beta1=0.8, beta2=0.95, eps=1e-8)
+
+
+def make_adam(model, lr, beta1, weight_decay, decoupled):
+    scale = lr / ADAM_DEFAULTS['lr']
+    groups = {'matrices': [], 'embeddings': [], 'scalars': []}
+    for name, parameter in model.named_parameters():
+        if name == 'transformer.wte.weight' or 'value_embeds' in name:
+            groups['embeddings'].append(parameter)
+        elif 'lambdas' in name:
+            groups['scalars'].append(parameter)
+        else:
+            groups['matrices'].append(parameter)
+    param_groups = [
+        {'params': groups['matrices'], 'lr': lr, 'weight_decay': weight_decay},
+        {'params': groups['embeddings'], 'lr': ADAM_DEFAULTS['embedding_lr'] * scale, 'weight_decay': 0.0},
+        {'params': groups['scalars'], 'lr': ADAM_DEFAULTS['scalar_lr'] * scale, 'weight_decay': 0.0},
+    ]
+    kind = torch.optim.AdamW if decoupled else torch.optim.Adam
+    return kind(param_groups, betas=(beta1, ADAM_DEFAULTS['beta2']), eps=ADAM_DEFAULTS['eps'])
+
 
 def make_optimizer(model, lr, momentum):
     groups = [
@@ -52,6 +75,12 @@ def main():
     parser.add_argument('--lr', type=float, help='Override the base learning rate for the selected token budget.')
     parser.add_argument('--momentum', type=float, help='Override SGD momentum for the selected token budget.')
     parser.add_argument('--steps', type=int, help='Stop early; keep the full selected training subset.')
+    parser.add_argument(
+        '--optimizer', choices=['sgd', 'adam', 'adamw'], default='sgd',
+        help="adam/adamw default to the paper's 1M Adam settings (Table 7); --lr sets the matrix rate and "
+             'scales the embedding and scalar rates with it, --momentum sets beta1.',
+    )
+    parser.add_argument('--weight-decay', type=float, default=0.0, help='Matrix weight decay (adam/adamw only).')
     parser.add_argument('--compile', action='store_true', help='torch.compile the model.')
     parser.add_argument(
         '--device', choices=['cuda', 'mps'],
@@ -59,8 +88,12 @@ def main():
     )
     args = parser.parse_args()
     defaults = DEFAULT_CONFIGS[args.tokens]
-    args.lr = defaults['lr'] if args.lr is None else args.lr
-    args.momentum = defaults['momentum'] if args.momentum is None else args.momentum
+    if args.optimizer == 'sgd':
+        args.lr = defaults['lr'] if args.lr is None else args.lr
+        args.momentum = defaults['momentum'] if args.momentum is None else args.momentum
+    else:
+        args.lr = ADAM_DEFAULTS['lr'] if args.lr is None else args.lr
+        args.momentum = ADAM_DEFAULTS['beta1'] if args.momentum is None else args.momentum
 
     if int(os.environ.get('WORLD_SIZE', 1)) != 1:
         parser.error('This baseline uses one GPU; launch it with python, not torchrun.')
@@ -103,17 +136,21 @@ def main():
     model = make_model(config, device, args.seed).requires_grad_(True)
     if args.compile:
         compile_model(model)
-    optimizer = make_optimizer(model, args.lr, args.momentum)
+    if args.optimizer == 'sgd':
+        optimizer = make_optimizer(model, args.lr, args.momentum)
+    else:
+        optimizer = make_adam(model, args.lr, args.momentum, args.weight_decay, args.optimizer == 'adamw')
     if args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f'Choose an empty output directory: {args.output}')
     args.output.mkdir(parents=True, exist_ok=True)
     metadata = dict(
         method='backprop', tokens=args.tokens, seed=args.seed, steps=steps,
-        lr=args.lr, momentum=args.momentum, weight_decay=0.0,
+        optimizer=args.optimizer, lr=args.lr, momentum=args.momentum,
+        weight_decay=args.weight_decay if args.optimizer != 'sgd' else 0.0,
         device=device.type, compiled=args.compile,
         training_tokens=steps * 8 * config.sequence_len,
         validation_sequences=544, test_sequences=544, model=asdict(config),
-        parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],
+        parameter_groups=[dict(lr=g['lr'], momentum=g.get('momentum'), betas=g.get('betas'),
                                parameters=sum(p.numel() for p in g['params']))
                           for g in optimizer.param_groups],
         source_sha256=file_hash(Path(__file__)),
@@ -136,7 +173,7 @@ def main():
     history = [dict(step=0, val_loss=best)]
     interval = defaults['eval_interval']
     start = time.monotonic()
-    print(f'Backprop SGD: {args.tokens}, {steps} steps, val={best:.4f}', flush=True)
+    print(f'Backprop {args.optimizer}: {args.tokens}, {steps} steps, val={best:.4f}', flush=True)
 
     for step in range(1, steps + 1):
         batch = training[(step - 1) * 8:step * 8].to(device)
