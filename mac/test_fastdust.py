@@ -1,12 +1,14 @@
 """Exactness tests for fastdust.py on CPU in float32 with a small config.
 
-E options must reproduce dust.DUST draw for draw (same seed, same noise).
+E options must reproduce dust.DUST draw for draw (same seed, same noise). A1 options are only checked for
+running and, where the answer is known exactly (the exact head), against backprop.
     python mac/test_fastdust.py
 """
 from pathlib import Path
 import sys
 
 import torch
+from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import dust  # noqa: E402
@@ -48,6 +50,10 @@ def compare(a, b, label, tol):
     return worst <= tol
 
 
+def cosine(a, b):
+    return F.cosine_similarity(a.flatten().double(), b.flatten().double(), dim=0).item()
+
+
 def main():
     torch.manual_seed(0)
     config, x, y = setup()
@@ -59,6 +65,29 @@ def main():
         fast, _ = estimates(lambda m: fastdust.FastDUST(m, settings, options, seed=42), config, x, y)
         ok &= compare(reference, fast, f'E truncate={truncate} vs dust.DUST (bitwise)', 0.0)
 
+    # Backprop gradient of the same small model, for the exact-head check.
+    model = dust.make_model(config, torch.device('cpu'), seed=42).requires_grad_(True)
+    model(x, y).backward()
+    true = {n: p.grad.detach().clone() for n, p in model.named_parameters()}
+
+    checks = [
+        ('A1 exact_head', fastdust.Options(exact_head=True)),
+        ('A1 derive_hidden', fastdust.Options(derive_hidden=True)),
+        ('A1 derive_attn_out', fastdust.Options(derive_attn_out=True)),
+    ]
+    for label, options in checks:
+        grads, _ = estimates(lambda m: fastdust.FastDUST(m, settings, options, seed=42), config, x, y)
+        finite = all(torch.isfinite(g).all() for g in grads.values())
+        head = cosine(grads['lm_head.weight'], true['lm_head.weight'])
+        fc = sum(cosine(grads[f'transformer.h.{i}.mlp.c_fc.weight'], true[f'transformer.h.{i}.mlp.c_fc.weight'])
+                 for i in range(8)) / 8
+        print(f'     {label}: finite={finite}, cos(head, backprop)={head:.4f}, mean cos(c_fc, backprop)={fc:.4f}')
+        ok &= finite
+        if options.exact_head:
+            ratio = (grads['lm_head.weight'].norm() / true['lm_head.weight'].norm()).item()
+            exact = head > 0.9999 and abs(ratio - 0.5) < 1e-3  # batch of 2: shrink (b - 1) / b = 1/2
+            print(f'{"PASS" if exact else "FAIL"} exact head: cos {head:.6f}, norm ratio {ratio:.4f} (expect 0.5)')
+            ok &= exact
     # The compiled per-chunk local/head kernels, run uncompiled, against the reference.
     def per_chunk(m):
         est = fastdust.FastDUST(m, settings, fastdust.Options(), seed=42)

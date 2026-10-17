@@ -3,10 +3,16 @@
 Each option has a tier:
   E   exact: the same estimator; with the same noise, the same numbers up to float rounding
   N   numerical: the same algorithm with different arithmetic (e.g. torch.compile fusion)
+  A1  algorithmic, same target: another estimator of the same expected update, with lower variance or cost
 
 With the default Options (E only), FastDUST draws the same noise in the same order as DUST and gives the same
 estimates. Draws run through an explicit functional forward instead of module hooks, so a draw that jitters
 block l starts at the jittered module from cached clean activations instead of rerunning the whole network.
+
+Scale: DUST's estimates carry fixed shrink factors that its tuned learning rates absorb. Direct-loss draws
+centered over a chunk of n draws estimate (n - 1) / n of the error; the head's batch centering gives
+(b - 1) / b. A1 options that remove a shrink (the exact head) multiply by the same factor,
+so a training run keeps the reference's effective learning rates.
 """
 import argparse
 from contextlib import nullcontext
@@ -32,9 +38,27 @@ class Options:
     truncate: bool = True
     # N: torch.compile the functional forward pieces, the head-draw and the local-draw kernels
     compile: bool = False
+    # A1: exact softmax/cross-entropy error for the head instead of slab draws (no draws, cos 1 with backprop)
+    exact_head: bool = False
+    # A1: MLP hidden (c_fc) error = relu2'(h) * (MLP output error @ W): no c_fc draws (exact per-token map)
+    derive_hidden: bool = False
+    # A1: attention output (o) error = attention projection error @ W: no o draws (exact per-token map)
+    derive_attn_out: bool = False
+    # A1: draws jitter only each block's output (mlp.c_proj); the attention projection's error is the block
+    #     output error mapped back through the MLP's exact per-token Jacobian (no cross-token terms)
+    block_output_draws: bool = False
+    # A1: token-embedding error from the block errors through the exact per-token maps of the residual mix
+    #     (and block 0's same-token attention map): no embedding draws
+    derive_embedding: bool = False
+    # A1: the last block's output error exactly, from the exact head error through the final norm (no draws)
+    exact_last_block: bool = False
+    # A1: attention internals from the closed-form expectation of DUST's local estimator (credit decay gamma,
+    #     own-token queries) given the attention-output error: no local draws, no local sampling noise
+    closed_form_local: bool = False
 
     def tiers(self):
-        tier = {'truncate': 'E', 'compile': 'N'}
+        tier = {'truncate': 'E', 'compile': 'N', 'exact_head': 'A1', 'derive_hidden': 'A1',
+                'derive_attn_out': 'A1', 'block_output_draws': 'A1', 'derive_embedding': 'A1', 'closed_form_local': 'A1', 'exact_last_block': 'A1'}
         return {f.name: tier[f.name] for f in fields(self) if getattr(self, f.name)}
 
 
@@ -141,6 +165,51 @@ def _local_chunk(kind: str, a, raw, qp, kp, values, baseline, credit, target, z,
     return estimate.reshape(b, t, -1) / divisor
 
 
+def _closed_form_sequence(q, k, v, g, outside, credit_t, scale: float):
+    """Closed-form local errors of one sequence of one block, heads batched: q, k, v, g are [H, T, D];
+    outside is the [s, t] mask of keys outside the window, credit_t[s, t] = C[t, s]. See
+    FastDUST.closed_form_local_errors."""
+    logits = (q @ k.transpose(-1, -2)) * scale
+    P = torch.softmax(logits.masked_fill(outside, float('-inf')), dim=-1)
+    S = g @ v.transpose(-1, -2) - (g * (P @ v)).sum(-1, keepdim=True)  # <g_s, v_t - o_s>
+    PC = P * credit_t
+    return PC.transpose(-1, -2) @ g, (PC * S).transpose(-1, -2) @ q * scale, (P * S) @ k * scale
+
+
+def _rms_norm_vjp(x, v):
+    """v^T d norm(x) / dx for norm(x) = x / rms(x), per token (F.rms_norm without weight, default eps)."""
+    x = x.float()
+    eps = torch.finfo(x.dtype).eps
+    inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    y = x * inv
+    return (v - y * (y * v).mean(-1, keepdim=True)) * inv
+
+
+def _same_token_attention(q, k, v, window):
+    """Attention whose output equals model.attention but whose keys/values get gradient only from their own
+    token's query: its VJP is the same-token (own-token input, cached context) Jacobian. See cosine_probe.py."""
+    out = attention(q, k.detach(), v.detach(), window)
+    B, T, H, D = q.shape
+    scale = D ** -0.5
+    dt = torch.promote_types(q.dtype, torch.float32)
+    with torch.no_grad():
+        qh, kh = q.detach().transpose(1, 2).to(dt), k.detach().transpose(1, 2).to(dt)
+        lse = torch.empty(B, H, T, device=q.device, dtype=dt)
+        for start in range(0, T, 256):
+            stop = min(T, start + 256)
+            logits = qh[:, :, start:stop] @ kh.transpose(-1, -2) * scale
+            rows = torch.arange(start, stop, device=q.device)[:, None]
+            cols = torch.arange(T, device=q.device)[None, :]
+            logits = logits.masked_fill(~((rows - cols >= 0) & (rows - cols <= window)), float('-inf'))
+            lse[:, :, start:stop] = torch.logsumexp(logits, dim=-1)
+        lse = lse.transpose(1, 2).unsqueeze(-1)
+    p_live = torch.exp((q.detach().to(dt) * k.to(dt)).sum(-1, keepdim=True) * scale - lse)
+    p_dead = p_live.detach()
+    o, v_dead = out.detach().to(dt), v.detach().to(dt)
+    live = (o - p_dead * v_dead + p_live * v.to(dt)) / (1 - p_dead + p_live)
+    return out + (live - live.detach()).to(out.dtype)
+
+
 class FastDUST(DUST):
     """DUST with a functional, truncatable forward for the draws. Hooks are not used."""
 
@@ -167,6 +236,7 @@ class FastDUST(DUST):
         self._head_fn = compile_fn(_head_loss)
         self._head_chunk_fn = compile_fn(_head_chunk)
         self._local_fn = compile_fn(_local_chunk)
+        self._closed_form_fn = compile_fn(_closed_form_sequence)
 
     # ---- noise -------------------------------------------------------------------------------------------
     def chunk_noise(self, n, *shape):
@@ -184,7 +254,7 @@ class FastDUST(DUST):
         cos, sin = m.cos[:, :T], m.sin[:, :T]
         self.cos_sin = (cos, sin)
         inputs, outputs = self.inputs, self.outputs
-        self.mix, self.mid, self.o, self.ve = [], [], [], []
+        self.mix, self.mid, self.o, self.ve, self.out = [], [], [], [], []
         with self.autocast():
             e = F.embedding(x, m.transformer.wte.weight)
             inputs['transformer.wte'], outputs['transformer.wte'] = x, e
@@ -226,6 +296,7 @@ class FastDUST(DUST):
                 ym = F.linear(act, blk['wmproj'])
                 inputs[prefix + 'mlp.c_proj'], outputs[prefix + 'mlp.c_proj'] = act, ym
                 h = h + ym
+                self.out.append(h)
             xn = norm(h)
             raw = F.linear(xn, m.lm_head.weight)
             inputs['lm_head'], outputs['lm_head'] = xn, raw
@@ -251,6 +322,8 @@ class FastDUST(DUST):
             return 'o', layer
         if any(s.endswith('attn.c_proj') for s in sites):
             return 'proj', layer
+        if all(s.endswith('mlp.c_proj') for s in sites):
+            return 'out', layer
         return 'hidden', layer
 
     def _forward_from(self, kind, layer, jitter, n, reps):
@@ -283,14 +356,20 @@ class FastDUST(DUST):
             x_mix = m.resid_lambdas[layer] * x + m.x0_lambdas[layer] * x0
             o = self._attn_fn(x_mix, reps['ve'][layer], b['wq'], b['wk'], b['wv'], b['wg'], cos, sin,
                               b['window'], self.n_head)
-            if kind == 'hidden':
+            if kind in ('hidden', 'out'):
                 x_mid = x_mix + F.linear(o, b['wproj'])
                 hidden = F.linear(norm(x_mid), b['wfc'])
         else:
             x0, x_mix, o = reps['x0'], reps.get('mix'), reps.get('o')
             x_mid, hidden = reps.get('mid'), reps.get('hidden')
         b, prefix = self.blocks[layer], f'transformer.h.{layer}.'
-        if kind in ('o', 'proj'):
+        if kind == 'out':  # only the MLP output is jittered: x_mid + (clean output + jitter)
+            if not self.options.truncate:
+                x = self._tail_h_fn(x_mid, hidden, b['wmproj'], None, jitter.get(prefix + 'mlp.c_proj'))
+            else:
+                y = reps['mlp_out']
+                x = reps['mid'] + (y + jitter[prefix + 'mlp.c_proj'].to(y.dtype))
+        elif kind in ('o', 'proj'):
             x = self._tail_o_fn(x_mix, o, b['wproj'], b['wfc'], b['wmproj'], jitter.get(f'o@{layer}'),
                                 jitter.get(prefix + 'attn.c_proj'), jitter.get(prefix + 'mlp.c_proj'))
         else:
@@ -311,6 +390,9 @@ class FastDUST(DUST):
         reps['x0'] = self._rep(self.x0, n)
         if kind in ('o', 'proj'):
             reps['mix'], reps['o'] = self._rep(self.mix[layer], n), self._rep(self.o[layer], n)
+        elif kind == 'out':
+            reps['mid'] = self._rep(self.mid[layer], n)
+            reps['mlp_out'] = self._rep(self.outputs[f'transformer.h.{layer}.mlp.c_proj'], n)
         else:
             reps['mid'] = self._rep(self.mid[layer], n)
             reps['hidden'] = self._rep(self.outputs[f'transformer.h.{layer}.mlp.c_fc'], n)
@@ -339,6 +421,8 @@ class FastDUST(DUST):
 
     # ---- head ---------------------------------------------------------------------------------------------------
     def head_error(self, draws, sigma=0.05):
+        if self.options.exact_head:
+            return self.exact_head_error()
         if not self.options.compile:
             return super().head_error(draws, sigma)
         n, b, t = self.settings.nrep, self.batch, self.length
@@ -410,6 +494,192 @@ class FastDUST(DUST):
             return super().reassemble(site, error)
         return torch.einsum('btd,bti->di', error, x.float())
 
+    def mix_errors(self, writer_errors):
+        """Errors at each block's mixed input x_mix_i = lam_i x_(i-1) + lam0_i x0 from the block errors:
+        e_mix_i = e_out_(i-1) / lam_i for i >= 1, and for block 0 its attention-projection error mapped back
+        through its attention with the same-token (own-token, cached context) Jacobian."""
+        m, L = self.model, self.model.config.n_layer
+        lam = m.resid_lambdas.float()
+        e_mix = [None] + [writer_errors[f'transformer.h.{i - 1}.mlp.c_proj'] / lam[i] for i in range(1, L)]
+        e_mid0 = writer_errors['transformer.h.0.attn.c_proj']
+        b = self.blocks[0]
+        cos, sin = self.cos_sin
+        with torch.enable_grad():
+            x = self.mix[0].detach().float().requires_grad_(True)
+            B, T, _ = x.shape
+            xn = norm(x)
+            q = F.linear(xn, b['wq'].float()).view(B, T, self.n_head, -1)
+            k = F.linear(xn, b['wk'].float()).view(B, T, self.n_head, -1)
+            v = F.linear(xn, b['wv'].float()).view(B, T, self.n_head, -1)
+            if self.ve[0] is not None:
+                gate = 2 * torch.sigmoid(F.linear(xn[..., :b['wg'].shape[1]], b['wg'].float()))
+                v = v + gate.unsqueeze(-1) * self.ve[0].float().view(B, T, self.n_head, -1)
+            q, k = norm(apply_rotary_emb(q, cos.float(), sin.float())), norm(apply_rotary_emb(k, cos.float(), sin.float()))
+            o = _same_token_attention(q, k, v, b['window']).contiguous().view(B, T, -1)
+            y = F.linear(o, b['wproj'].float())
+            (back,) = torch.autograd.grad(y, x, grad_outputs=e_mid0.float())
+        e_mix[0] = e_mid0 + back
+        return e_mix
+
+    def closed_form_local_errors(self, targets):
+        """The expectation of DUST.local_errors given the attention-output errors (targets), in closed form.
+
+        With P the clean attention probabilities of a head and C[t, s] = gamma^(s - t) inside the causal window,
+        the local estimator's expected errors are (per head, before the per-token maps back to module outputs):
+          value v_t:        dV_t = sum_s C[t, s] P[s, t] g_s
+          value embedding:  2 sigmoid(z_t) dV_t;   gate z_t: 2 sigmoid'(z_t) <ve_t, dV_t>
+          key k_t:          sum_s C[t, s] P[s, t] <g_s, v_t - o_s> q_s / sqrt(d)
+          query q_s:        sum_t P[s, t] <g_s, v_t - o_s> k_t / sqrt(d)   (own token, no credit)
+        Queries and keys go back through rotary and the per-head RMS norm with their exact per-token maps.
+        """
+        cfg = self.model.config
+        B, T = self.batch, self.length
+        H, D = cfg.n_head, cfg.n_embd // cfg.n_head
+        cos, sin = self.model.cos[:, :T].float(), self.model.sin[:, :T].float()
+        pos = torch.arange(T, device=self.device)
+        lag = pos[None, :] - pos[:, None]  # [t, s] = s - t
+        gradients = {}
+        for i in range(cfg.n_layer):
+            prefix = f'transformer.h.{i}.attn.'
+            window = self.model.window_sizes[i][0]
+            inside = (lag >= 0) & (lag <= window)
+            credit = inside.float() * self.settings.gamma ** lag.clamp(min=0).float()  # [t, s]
+            outside_t, credit_t = (~inside).T.contiguous(), credit.T.contiguous()  # indexed [s, t]
+            with torch.enable_grad():
+                q_raw = self.outputs[prefix + 'c_q'].detach().float().view(B, T, H, D).requires_grad_(True)
+                k_raw = self.outputs[prefix + 'c_k'].detach().float().view(B, T, H, D).requires_grad_(True)
+                qp = norm(apply_rotary_emb(q_raw, cos, sin))
+                kp = norm(apply_rotary_emb(k_raw, cos, sin))
+            v = self.outputs[prefix + 'c_v'].float().view(B, T, H, D)
+            ve = z = None
+            if has_ve(i, cfg.n_layer):
+                z = self.outputs[prefix + 've_gate'].float()
+                ve = self.outputs[f'value_embeds.{i}'].float().view(B, T, H, D)
+                v = v + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve
+            q_h, k_h, v_h = (t_.detach().transpose(1, 2) for t_ in (qp, kp, v))  # [B, H, T, D]
+            g = targets[i].float().view(B, T, H, D).transpose(1, 2)
+            dV, dK, dQ = torch.empty_like(g), torch.empty_like(g), torch.empty_like(g)
+            for b in range(B):  # one sequence at a time keeps the [H, T, T] matrices small
+                dV[b], dK[b], dQ[b] = self._closed_form_fn(q_h[b].contiguous(), k_h[b].contiguous(),
+                                                           v_h[b].contiguous(), g[b].contiguous(),
+                                                           outside_t, credit_t, D ** -0.5)
+            with torch.enable_grad():
+                eq, ek = torch.autograd.grad((qp, kp), (q_raw, k_raw),
+                                             grad_outputs=(dQ.transpose(1, 2), dK.transpose(1, 2)))
+            dV = dV.transpose(1, 2)  # [B, T, H, D]
+            errors = {prefix + 'c_q': eq.reshape(B, T, -1), prefix + 'c_k': ek.reshape(B, T, -1),
+                      prefix + 'c_v': dV.reshape(B, T, -1)}
+            if ve is not None:
+                gate = 2 * torch.sigmoid(z)
+                errors[f'value_embeds.{i}'] = (gate.unsqueeze(-1) * dV).reshape(B, T, -1)
+                errors[prefix + 've_gate'] = 2 * torch.sigmoid(z) * (1 - torch.sigmoid(z)) * (ve * dV).sum(-1)
+            for site, error in errors.items():
+                gradients[site + '.weight'] = self.reassemble(site, error)
+        return gradients
+
+    def last_block_error(self):
+        """d loss_t / d x_out_t at the last block's output, exactly (head error back through the final norm),
+        at the draws' reference scale (n - 1) / n."""
+        n, b = self.settings.nrep, self.batch
+        logits_error = self.exact_head_error() / ((b - 1) / b if b > 1 else 1.0)
+        back = logits_error @ self.model.lm_head.weight.float()
+        return _rms_norm_vjp(self.out[-1], back) * ((n - 1) / n if n > 1 else 1.0)
+
+    def exact_head_error(self):
+        """d loss_t / d raw logits_t exactly, scaled by the batch-centering shrink (b - 1) / b of the draws."""
+        raw = self.outputs['lm_head']
+        vocab = self.model.config.vocab_size
+        capped = 15 * torch.tanh(raw[..., :vocab].float() / 15)
+        probs = torch.softmax(capped, dim=-1)
+        target = self.y.clamp(min=0)
+        probs.scatter_add_(-1, target.unsqueeze(-1), -torch.ones_like(probs[..., :1]))
+        probs *= 1 - (capped / 15) ** 2  # derivative of the soft cap
+        probs *= (self.y != -1).unsqueeze(-1)
+        error = torch.zeros_like(raw, dtype=torch.float32)
+        error[..., :vocab] = probs
+        b = self.batch
+        return error * ((b - 1) / b if b > 1 else 1.0)
+
+    # ---- update ---------------------------------------------------------------------------------------------------
+    @torch.no_grad()
+    def step(self, x, y, optimizer):
+        """DUST.step with the options; with E-only options it makes the same calls in the same order."""
+        o = self.options
+        self.capture(x, y)
+        r, world = self.settings, self.world
+        cfg = self.model.config
+        gradients, writer_errors = {}, {}
+        for layer in range(cfg.n_layer):
+            prefix = f'transformer.h.{layer}.'
+            writer_sites = [prefix + 'mlp.c_proj'] if o.block_output_draws else [prefix + 'attn.c_proj', prefix + 'mlp.c_proj']
+            groups = [(writer_sites, r.writers[layer])]
+            if o.exact_last_block and layer == cfg.n_layer - 1:
+                if not (o.block_output_draws and o.exact_head):
+                    raise ValueError('exact_last_block needs block_output_draws and exact_head')
+                site = prefix + 'mlp.c_proj'
+                writer_errors[site] = self.last_block_error()
+                gradients[site + '.weight'] = self.reassemble(site, writer_errors[site])
+                groups = []
+            if not o.derive_hidden:
+                groups.append(([prefix + 'mlp.c_fc'], r.hidden[layer]))
+            for sites, count in groups:
+                for site, error in self.direct_errors(sites, count // world, 0.2).items():
+                    gradients[site + '.weight'] = self.reassemble(site, error)
+                    writer_errors[site] = error
+            if o.derive_hidden or o.block_output_draws:  # relu(h)^2 has derivative 2 relu(h)
+                site = prefix + 'mlp.c_fc'
+                hidden_error = (average_ranks(writer_errors[prefix + 'mlp.c_proj'])
+                                @ self.modules[prefix + 'mlp.c_proj'].weight.float()) * (2 * F.relu(self.outputs[site].float()))
+                if o.derive_hidden:
+                    gradients[site + '.weight'] = self.reassemble(site, hidden_error)
+            if o.block_output_draws:  # x_out = x_mid + MLP(norm(x_mid)): per-token map back to x_mid
+                site = prefix + 'attn.c_proj'
+                back = _rms_norm_vjp(self.mid[layer], hidden_error @ self.modules[prefix + 'mlp.c_fc'].weight.float())
+                writer_errors[site] = average_ranks(writer_errors[prefix + 'mlp.c_proj']) + back
+                gradients[site + '.weight'] = self.reassemble(site, writer_errors[site])
+            if o.derive_attn_out:
+                writer_errors[f'o@{layer}'] = (average_ranks(writer_errors[prefix + 'attn.c_proj'])
+                                                @ self.modules[prefix + 'attn.c_proj'].weight.float())
+
+        site = 'transformer.wte'
+        if o.derive_embedding:
+            e_mix = self.mix_errors(writer_errors)
+            lam, lam0 = self.model.resid_lambdas.float(), self.model.x0_lambdas.float()
+        if o.derive_embedding:  # x0 = norm(e) feeds block 0 (lam_0 x0 + lam0_0 x0) and every mix (lam0_i x0)
+            e_x0 = lam[0] * e_mix[0] + sum(lam0[i] * e_mix[i] for i in range(cfg.n_layer))
+            gradients[site + '.weight'] = self.reassemble(site, _rms_norm_vjp(self.outputs[site], e_x0))
+        else:
+            error = self.direct_errors([site], r.embedding // world, r.embedding_sigma)[site]
+            gradients[site + '.weight'] = self.reassemble(site, error)
+
+        targets = {}
+        for layer in range(cfg.n_layer):
+            if o.derive_attn_out:
+                targets[layer] = writer_errors[f'o@{layer}']
+                continue
+            site = f'o@{layer}'
+            sigma = 0.2 if layer < cfg.n_layer // 2 else 0.4
+            targets[layer] = average_ranks(self.direct_errors([site], r.hubs[layer] // world, sigma)[site])
+
+        gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
+        if o.closed_form_local:
+            gradients.update(self.closed_form_local_errors(targets))
+        else:
+            for kind, count in r.local.items():
+                for site, error in self.local_errors(kind, count // world, targets).items():
+                    gradients[site + '.weight'] = self.reassemble(site, error)
+        gradients.update(self.scalar_gradients(8 // world))
+
+        valid_tokens = (y != -1).sum()
+        optimizer.zero_grad(set_to_none=True)
+        for name, parameter in self.model.named_parameters():
+            gradient = average_ranks((gradients[name] / valid_tokens).to(parameter.dtype))
+            if not torch.isfinite(gradient).all():
+                raise FloatingPointError(f'Non-finite estimate for {name}')
+            parameter.grad = gradient
+        optimizer.step()
+        return self.clean_loss[y != -1].mean().item()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -427,7 +697,7 @@ def main():
     parser.add_argument('--scale-draws', type=json.loads, default=None,
                         help='JSON dict multiplying recipe streams, e.g. {"writers": 2}.')
     parser.add_argument('--writers', type=json.loads, default=None,
-                        help='JSON list of writer draws per block, overriding the recipe.')
+                        help='JSON list of writer (block-output) draws per block, overriding the recipe.')
     for f in fields(Options):
         default = f.default
         parser.add_argument(f'--{f.name.replace("_", "-")}', action=argparse.BooleanOptionalAction, default=default)

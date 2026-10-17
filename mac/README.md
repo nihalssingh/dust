@@ -8,6 +8,7 @@ Every change is labeled with what it does to the algorithm:
 |---|---|---|
 | **E**, exact | the paper's estimator; with the same noise, the same numbers (engineering only) | bit-for-bit against `dust.py` on CPU in float32 with the same noise (`mac/test_fastdust.py`), and the port's `dust.py` bit-for-bit against upstream (`mac/equivalence_check.py`); on MPS the same estimator up to kernel rounding |
 | **N**, numerical | the same algorithm with different arithmetic (kernels, fusion, precision) | the estimate's cosine with the true gradient is unchanged |
+| **A1**, algorithmic, same target | a different estimator of the same expected update (the paper's same-token target), with less variance or cost | expectation checks against exact targets, then cosine and training loss |
 
 Tested on a MacBook Pro (M5, 10-core, 24 GB unified memory), macOS 26, PyTorch 2.14.1.
 
@@ -52,7 +53,14 @@ python baselines/backprop.py --tokens 1M --compile --data-dir ../data --output .
 | option | tier | what it does |
 |---|---|---|
 | `truncate` (default) | E | a draw that jitters block l reruns only from the jittered module onward, from cached clean activations |
-| (functional forward, per-chunk local/head kernels, native-dtype caches) | E / N when compiled | same math, fewer passes and less memory |
+| (functional forward, per-chunk local/head kernels, per-sequence closed form, native-dtype caches) | E / N when compiled | same math, fewer passes and less memory |
+| `exact_head` | A1 | the head's error from the analytic softmax/cross-entropy derivative instead of 1,024 slab draws (cos 1) |
+| `block_output_draws` | A1 | draws jitter only each block's output; the attention projection's error is that error mapped back through the MLP's exact per-token Jacobian. Removes the co-jittered site's interference |
+| `derive_hidden` | A1 | MLP hidden error = 2 relu(h) * (W_proj^T e): no MLP-hidden draws |
+| `derive_attn_out` | A1 | attention-output error = W_o^T e: no attention-output draws |
+| `derive_embedding` | A1 | token-embedding error from the block errors through the residual mix (and block 0's same-token attention map): no embedding draws |
+| `closed_form_local` | A1 | the attention internals' estimates replaced by the closed-form expectation of the paper's own local estimator (credit decay 0.98, own-token queries): no local draws, no local sampling noise |
+| `exact_last_block` | A1 | the last block's output error exactly, from the exact head error through the final norm |
 
 Two analysis tools: `mac/cosine_probe.py` computes DUST's infinite-population target (the same-token gradient)
 exactly with an attention whose backward cuts cross-token paths, verified against brute force;
